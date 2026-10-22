@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 from nonprehensile import pipeline
@@ -9,7 +10,9 @@ def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "build", lambda *a, **k: None)
 
     def process(command, **kwargs):
-        kind = command[3]
+        assert command[0] == sys.executable
+        assert Path(command[1]).name == "cli.py"
+        kind = command[2]
         output = Path(command[command.index("--output") + 1])
         if kind == "train":
             config = json.loads(Path(command[command.index("--config") + 1]).read_text())

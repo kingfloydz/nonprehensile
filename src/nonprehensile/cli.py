@@ -1,8 +1,15 @@
 import argparse
 import json
 
+if __name__ == "__main__" and not __package__:
+    import sys
+    from pathlib import Path
 
-def main():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "nonprehensile"
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     bank = sub.add_parser("bank")
@@ -30,7 +37,7 @@ def main():
     test.add_argument("--output", required=True)
     test.add_argument("--episodes", type=int, default=8192)
     test.add_argument("--device", default="cuda:0")
-    args = vars(parser.parse_args())
+    args = vars(parser.parse_args(argv))
     command = args.pop("command")
     if command == "bank":
         from .bank import build

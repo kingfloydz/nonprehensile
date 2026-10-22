@@ -14,16 +14,21 @@ and GPU-enabled mjlab 1.6.0. In that environment:
 ```bash
 git clone https://github.com/kingfloydz/nonprehensile.git
 cd nonprehensile
-pip install -e .
-npt pipeline --gpus 0 --num-envs 4096 --root runs/main
+python3 -m pip install -e .
+python3 src/nonprehensile/pipeline.py --gpus 0 --num-envs 4096 --root runs/main
 ```
 
 Several GPUs run independent experiments concurrently (one process per GPU):
 
 ```bash
-npt pipeline --gpus 0 1 2 3 --num-envs 8192 --root runs/h200 \
+python3 src/nonprehensile/pipeline.py --gpus 0 1 2 3 --num-envs 8192 --root runs/h200 \
   --search-iterations 300 --final-iterations 2000 --bank-size 8192 --workers 16
 ```
+
+An absolute script path also works from any working directory. Relative output
+paths are resolved against the working directory. Training and test subprocesses
+use the same Python interpreter as the pipeline (`sys.executable`). With the
+dependencies already installed in system Python, editable installation is optional.
 
 The pipeline performs **145 search runs + 19 final runs**. Sticking E is omitted
 because it has no startup transition and would duplicate D. Each PPO iteration

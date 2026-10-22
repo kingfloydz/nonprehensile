@@ -1,5 +1,15 @@
 """One job per GPU; train -> validate -> select -> retrain -> held-out test."""
 
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from nonprehensile.cli import main
+
+    main(["pipeline", *sys.argv[1:]])
+    raise SystemExit
+
 import csv
 import itertools
 import json
@@ -83,8 +93,7 @@ def run(
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, MUJOCO_GL="egl", OMP_NUM_THREADS="4")
         command = [
             sys.executable,
-            "-m",
-            "nonprehensile.cli",
+            str(Path(__file__).with_name("cli.py")),
             "train",
             "--config",
             str(directory / "config.json"),
@@ -102,8 +111,7 @@ def run(
                     subprocess.run(
                         [
                             sys.executable,
-                            "-m",
-                            "nonprehensile.cli",
+                            str(Path(__file__).with_name("cli.py")),
                             "test",
                             "--checkpoint",
                             str(directory / "policy.pt"),
