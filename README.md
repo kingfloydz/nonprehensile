@@ -56,7 +56,7 @@ include normalized acceleration noise standard deviations 0, .01, .03, .05.
 
 | Setting | Value |
 |---|---|
-| Tray | 0.60 x 0.60 m |
+| Tray | 0.80 x 0.80 m |
 | Box length / width | independent U(0.06, 0.30) m |
 | Box height | U(0.05, 0.40) m |
 | Static = kinetic friction | U(0.10, 0.80) |

@@ -14,7 +14,7 @@ XML = """
   <option timestep="0.001" gravity="0 0 0" cone="elliptic"/>
   <default><geom condim="3" solref="0.004 1" solimp="0.95 0.99 0.001"/></default>
   <worldbody>
-    <geom name="tray" type="box" pos="0 0 -0.01" size="0.3 0.3 0.01"
+    <geom name="tray" type="box" pos="0 0 -0.01" size="0.4 0.4 0.01"
           friction="0.8 0 0" rgba="0.25 0.4 0.55 1"/>
     <body name="box" pos="0 0 0.1">
       <freejoint/>
@@ -244,7 +244,7 @@ class TrayEnv:
         )
         separation = bottom[:, :, 2].amin(1) > 0.008
         limits = (self.velocity.norm(dim=-1) > 2.0) | (self.omega.norm(dim=-1) > 3.0)
-        outside = (c[:, :2].abs() > 0.3).any(1)
+        outside = (c[:, :2].abs() > 0.4).any(1)
         failed = mode_fail | separation | limits | outside
         return success & ~failed, failed, started, error
 
