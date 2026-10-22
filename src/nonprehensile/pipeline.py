@@ -90,7 +90,7 @@ def run(
 
     def execute(directory, final=False):
         gpu = slots.get()
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, MUJOCO_GL="egl", OMP_NUM_THREADS="4")
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, OMP_NUM_THREADS="4")
         command = [
             sys.executable,
             str(Path(__file__).with_name("cli.py")),

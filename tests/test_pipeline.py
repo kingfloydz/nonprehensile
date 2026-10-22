@@ -1,15 +1,22 @@
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from nonprehensile import pipeline
 
 
-def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("gl_backend", ["disable", "egl"])
+def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch, gl_backend):
     calls = []
+    monkeypatch.setenv("MUJOCO_GL", gl_backend)
     monkeypatch.setattr(pipeline, "build", lambda *a, **k: None)
 
     def process(command, **kwargs):
+        assert kwargs["env"]["MUJOCO_GL"] == gl_backend
         assert command[0] == sys.executable
         assert Path(command[1]).name == "cli.py"
         kind = command[2]
@@ -76,3 +83,24 @@ def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch):
         assert config["env"]["margin_weight"] == 0.1
         assert config["env"]["startup_weight"] == 1.0
     assert (tmp_path / "results.csv").exists()
+
+
+def test_headless_default_before_mujoco_import():
+    env = dict(os.environ)
+    env.pop("MUJOCO_GL", None)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import nonprehensile, os; "
+            "assert os.environ['MUJOCO_GL'] == 'disable'; "
+            "import mujoco, sys; "
+            "assert 'mujoco.egl' not in sys.modules; "
+            "mujoco.MjModel.from_xml_string('<mujoco/>')",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
