@@ -39,6 +39,7 @@ class EnvConfig:
     margin_reference: float = 0.05
     margin_temperature: float = 0.05
     projection_iterations: int = 48
+    mapping_iterations: int = 32
     disturbance: float = 0.0
     discount: float = 0.99
 
@@ -102,7 +103,6 @@ class TrayEnv:
         self.origin = self.zeros(3)
         self.entered = torch.zeros(self.n, dtype=torch.bool, device=device)
         self.steps = torch.zeros(self.n, dtype=torch.long, device=device)
-        self.previous_action = self.zeros(6)
         self.scale = torch.tensor(SCALE, device=device)
         self.all_ids = torch.arange(self.n, device=device)
         self.reset(self.all_ids)
@@ -138,7 +138,7 @@ class TrayEnv:
         self.origin[ids, 2] = 0
         self.position[ids], self.velocity[ids], self.omega[ids] = 0, 0, 0
         self.quaternion[ids] = qpos.new_tensor([1.0, 0, 0, 0])
-        self.steps[ids], self.entered[ids], self.previous_action[ids] = 0, False, 0
+        self.steps[ids], self.entered[ids] = 0, False
         self.sim.recompute_constants(RecomputeLevel.set_const)
         self.sim.forward()
 
@@ -154,24 +154,59 @@ class TrayEnv:
 
     def observe(self):
         c, r, vr, wr, g, _ = self.state()
+        rt = rotation(self.quaternion).transpose(1, 2)
+        goal = self.zeros(3)
+        if self.cfg.task == "sticking":
+            goal = mv(rt, c.new_tensor([0.5, 0, 0]) - self.position) / 0.5
+        elif self.cfg.task == "sliding":
+            goal[:, 0] = (self.origin[:, 0] + 0.2 - c[:, 0]) / 0.2
+        else:
+            angle = (
+                torch.atan2(r[:, 0, 2], r[:, 0, 0])
+                if self.cfg.task == "tipping"
+                else torch.atan2(r[:, 1, 0], r[:, 0, 0])
+            )
+            goal[:, 0] = 1 - angle / (torch.pi / 2)
+        low, high = c.new_tensor([0.06, 0.06, 0.05]), c.new_tensor([0.30, 0.30, 0.40])
         return torch.cat(
             (
-                c - self.origin,
+                c / 0.4,
                 r.flatten(1),
-                vr,
-                wr,
-                self.position,
-                self.velocity,
-                self.omega,
-                self.quaternion,
+                vr / 2,
+                wr / 3,
+                mv(rt, self.velocity) / 2,
+                self.omega / 3,
                 g / 9.81,
-                self.size,
-                self.mu[:, None],
+                2 * (self.size - low) / (high - low) - 1,
+                2 * (self.mu[:, None] - 0.1) / 0.7 - 1,
+                goal,
                 self.entered[:, None].float(),
-                self.previous_action,
                 self.steps[:, None] / 250,
             ),
             -1,
+        )
+
+    def constraints(self, startup=None):
+        """Physical acceleration halfspaces/equalities; shared by rewards and F."""
+        c, rot, vr, wr, gravity, inertia = self.state()
+        if startup is None:
+            startup = torch.zeros_like(self.entered)
+        ids, task = self.bank_ids, self.cfg.task
+        return acceleration_constraints(
+            task,
+            self.bank[task + "_h"][ids],
+            self.bank[task + "_e"][ids],
+            c,
+            inertia,
+            self.mass,
+            self.omega,
+            gravity,
+            vr,
+            wr,
+            self.size,
+            rot,
+            self.origin,
+            startup,
         )
 
     def physics(self, chi):
@@ -264,9 +299,14 @@ class TrayEnv:
         return -(angle - torch.pi / 2).abs() / (torch.pi / 2)
 
     @torch.no_grad()
-    def step(self, action):
+    def step(self, action, invalid=None):
         potential = self.potential()
         action = action.clamp(-1, 1)
+        if invalid is None:
+            invalid = torch.zeros_like(self.entered)
+        # Invalid mappings terminate this transition. Zero is only a placeholder
+        # for the batched simulator, never a claimed feasible fallback action.
+        action = torch.where(invalid[:, None], 0.0, action)
         applied = action
         if self.cfg.disturbance:
             applied = (
@@ -277,32 +317,17 @@ class TrayEnv:
         margin, distance = self.zeros(), self.zeros()
         before_entry = ~self.entered
         if self.cfg.group in ("C", "D", "E"):
-            c, rot, vr, wr, gravity, inertia = self.state()
-            ids = self.bank_ids
             startup = before_entry if self.cfg.group == "E" else torch.zeros_like(before_entry)
-            h, e = self.bank[self.cfg.task + "_h"][ids], self.bank[self.cfg.task + "_e"][ids]
-            inequalities, equalities = acceleration_constraints(
-                self.cfg.task,
-                h,
-                e,
-                c,
-                inertia,
-                self.mass,
-                self.omega,
-                gravity,
-                vr,
-                wr,
-                self.size,
-                rot,
-                self.origin,
-                startup,
-            )
+            inequalities, equalities = self.constraints(startup)
             margin, distance = measures(
                 inequalities, equalities, applied, self.cfg.projection_iterations
             )
         self.physics(applied * self.scale)
         self.steps += 1
         success, failure, started, error = self.outcomes()
+        success &= ~invalid
+        physical_failure = failure & ~invalid
+        failure |= invalid
         self.entered |= started
         timeout = self.steps >= 250
         done = success | failure | timeout
@@ -322,13 +347,14 @@ class TrayEnv:
             elif self.cfg.task != "sticking":
                 physical *= (~before_entry).float()
             reward -= self.dt * physical
-        self.previous_action.copy_(action)
         info = dict(
             success=success.clone(),
             failure=failure.clone(),
             time=self.steps.float() * self.dt,
             margin=margin,
             distance=distance,
+            mapping_failure=invalid.clone(),
+            physical_failure=physical_failure,
         )
         # Return terminal outcomes while resetting completed worlds for the next action.
         ids = done.nonzero().flatten()

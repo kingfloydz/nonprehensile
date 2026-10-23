@@ -25,6 +25,7 @@ def main(argv=None):
     pipeline.add_argument("--final-iterations", type=int, default=2000)
     pipeline.add_argument("--bank-size", type=int, default=8192)
     pipeline.add_argument("--workers", type=int, default=8)
+    pipeline.add_argument("--groups", nargs="+", choices=list("ABCDEF"), default=list("ABCDEF"))
     train = sub.add_parser("train")
     train.add_argument("--config", required=True)
     train.add_argument("--bank", required=True)

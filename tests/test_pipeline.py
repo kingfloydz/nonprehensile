@@ -72,9 +72,9 @@ def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch, gl_
         bank_size=4,
         workers=1,
     )
-    assert len(calls) == 164
+    assert len(calls) == 168
     winners = list((tmp_path / "best").glob("*/*/config.json"))
-    assert len(winners) == 19
+    assert len(winners) == 23
     for path in winners:
         config = json.loads(path.read_text())
         assert config["env"]["seed"] == 1

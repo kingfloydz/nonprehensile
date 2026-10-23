@@ -42,6 +42,25 @@ def grid(group):
     return [dict(w, startup_weight=s) for w in weights for s in (0.3, 1.0, 3.0)]
 
 
+def configuration(task, group, num_envs, iterations, **weights):
+    return dict(
+        env=asdict(EnvConfig(task=task, group=group, num_envs=num_envs, seed=1, **weights)),
+        ppo=dict(
+            iterations=iterations,
+            rollout_steps=32,
+            epochs=4,
+            minibatches=16,
+            learning_rate=3e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            entropy=0.005,
+            compile=True,
+            log_interval=10,
+            validation_episodes=2048,
+        ),
+    )
+
+
 def run(
     root,
     gpus,
@@ -50,7 +69,10 @@ def run(
     final_iterations=2000,
     bank_size=8192,
     workers=8,
+    groups=("A", "B", "C", "D", "E", "F"),
 ):
+    if not gpus or not groups or any(g not in "ABCDEF" or len(g) != 1 for g in groups):
+        raise ValueError("Specify GPUs and groups from A, B, C, D, E, F.")
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     banks = root / "banks"
@@ -58,30 +80,13 @@ def run(
         build(banks / f"{split}.npz", bank_size, seed, workers)
     jobs = []
     for task in TASKS:
-        for group in "ABCDE":
-            if task == "sticking" and group == "E":
+        for group in dict.fromkeys(groups):
+            if group == "F" or (task == "sticking" and group == "E"):
                 continue
             for index, weights in enumerate(grid(group)):
                 directory = root / "search" / task / group / f"{index:03d}"
                 directory.mkdir(parents=True, exist_ok=True)
-                config = dict(
-                    env=asdict(
-                        EnvConfig(task=task, group=group, num_envs=num_envs, seed=1, **weights)
-                    ),
-                    ppo=dict(
-                        iterations=search_iterations,
-                        rollout_steps=32,
-                        epochs=4,
-                        minibatches=16,
-                        learning_rate=3e-4,
-                        gamma=0.99,
-                        gae_lambda=0.95,
-                        entropy=0.005,
-                        compile=True,
-                        log_interval=10,
-                        validation_episodes=2048,
-                    ),
-                )
+                config = configuration(task, group, num_envs, search_iterations, **weights)
                 (directory / "config.json").write_text(json.dumps(config, indent=2))
                 jobs.append(directory)
     slots = Queue()
@@ -108,23 +113,27 @@ def run(
             with (directory / "console.log").open("w") as log:
                 subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
                 if final:
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            str(Path(__file__).with_name("cli.py")),
-                            "test",
-                            "--checkpoint",
-                            str(directory / "policy.pt"),
-                            "--bank",
-                            str(banks / "test.npz"),
-                            "--output",
-                            str(directory / "test.json"),
-                        ],
-                        env=env,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        check=True,
-                    )
+                    for model in ("policy", "teacher") if directory.name == "F" else ("policy",):
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                str(Path(__file__).with_name("cli.py")),
+                                "test",
+                                "--checkpoint",
+                                str(directory / f"{model}.pt"),
+                                "--bank",
+                                str(banks / "test.npz"),
+                                "--output",
+                                str(
+                                    directory
+                                    / ("test.json" if model == "policy" else "teacher_test.json")
+                                ),
+                            ],
+                            env=env,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            check=True,
+                        )
         finally:
             slots.put(gpu)
         return directory
@@ -133,7 +142,18 @@ def run(
         list(pool.map(execute, jobs))
     selected = []
     for task in TASKS:
-        for group in "ABCDE":
+        for group in dict.fromkeys(groups):
+            if group == "F":
+                from .distill import DistillConfig
+
+                destination = root / "best" / task / group
+                destination.mkdir(parents=True, exist_ok=True)
+                cfg = configuration(task, group, num_envs, final_iterations)
+                cfg["ppo"]["validation_episodes"] = 4096
+                cfg["distill"] = asdict(DistillConfig())
+                (destination / "config.json").write_text(json.dumps(cfg, indent=2))
+                selected.append(destination)
+                continue
             candidates = [
                 p for p in jobs if p.parent.name == group and p.parent.parent.name == task
             ]
@@ -162,15 +182,26 @@ def run(
             fieldnames=[
                 "task",
                 "group",
+                "stage",
                 "episodes",
                 "success_rate",
                 "success_time",
                 "penalized_time",
                 "physical_failure_rate",
+                "mapping_failure_rate",
+                "constraint_violation_rate",
                 "disturbance",
             ],
         )
         writer.writeheader()
         for directory in selected:
-            for metrics in json.loads((directory / "test.json").read_text()):
-                writer.writerow(dict(task=directory.parent.name, group=directory.name, **metrics))
+            stages = [("student" if directory.name == "F" else "direct", "test.json")]
+            if directory.name == "F":
+                stages.append(("teacher", "teacher_test.json"))
+            for stage, file in stages:
+                for metrics in json.loads((directory / file).read_text()):
+                    writer.writerow(
+                        dict(
+                            task=directory.parent.name, group=directory.name, stage=stage, **metrics
+                        )
+                    )
