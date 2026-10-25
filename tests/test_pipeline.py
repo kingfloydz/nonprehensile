@@ -72,17 +72,49 @@ def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch, gl_
         bank_size=4,
         workers=1,
     )
-    assert len(calls) == 168
+    assert len(calls) == 49  # 26 candidates + 23 final runs (including four F teachers)
     winners = list((tmp_path / "best").glob("*/*/config.json"))
     assert len(winners) == 23
     for path in winners:
         config = json.loads(path.read_text())
         assert config["env"]["seed"] == 1
         assert config["ppo"]["iterations"] == 5
-        assert config["env"]["distance_weight"] == 1.0
-        assert config["env"]["margin_weight"] == 0.1
-        assert config["env"]["startup_weight"] == 1.0
+        task, group = path.parent.parent.name, path.parent.name
+        if group != "F":
+            candidates = [
+                pipeline.configuration(task, group, 2, 2, **w)["env"]
+                for w in pipeline.grid(task, group)
+            ]
+            expected = max(
+                candidates,
+                key=lambda c: sum(
+                    c[k] == v
+                    for k, v in (
+                        ("distance_weight", 1.0),
+                        ("margin_weight", 0.1),
+                        ("startup_weight", 1.0),
+                    )
+                ),
+            )
+            assert config["env"] == expected
+            selection = json.loads(path.with_name("selection.json").read_text())
+            assert selection["tied_candidates"] >= 1
     assert (tmp_path / "results.csv").exists()
+
+
+def test_reduced_grid_keeps_task_specific_candidates():
+    counts = [sum(len(pipeline.grid(t, g)) for g in "ABCDE") for t in pipeline.TASKS]
+    assert counts == [4, 9, 8, 5]
+    assert pipeline.grid("sliding", "E") == [
+        dict(distance_weight=10.0, margin_weight=m, startup_weight=s)
+        for m in (0.01, 1.0)
+        for s in (0.3, 3.0)
+    ]
+    assert pipeline.grid("tipping", "E") == [
+        dict(distance_weight=10.0, margin_weight=m, startup_weight=s)
+        for m in (0.01, 0.1)
+        for s in (1.0, 3.0)
+    ]
 
 
 def test_headless_default_before_mujoco_import():

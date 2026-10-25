@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from scipy.optimize import linprog
 
@@ -24,7 +25,10 @@ def test_double_description_matches_generator_membership():
                 assert primal == dual
 
 
-def test_scalar_elimination_matches_lifted_dynamics():
+@pytest.mark.parametrize("speed", [0.0, 0.4, -0.04])
+@pytest.mark.parametrize("dt", [0.02, 0.05])
+@pytest.mark.parametrize("startup", [False, True])
+def test_scalar_elimination_matches_lifted_dynamics(speed, dt, startup):
     size = torch.tensor([[0.16, 0.12, 0.20]], dtype=torch.float64)
     mass = torch.tensor([1.92], dtype=torch.float64)
     inertia = torch.diag_embed(
@@ -47,28 +51,10 @@ def test_scalar_elimination_matches_lifted_dynamics():
         ),
         -2,
     )[0].numpy()
-    b = np.array([0, 0, 0, 0, 0, mass.item() * 9.81])
     rng = np.random.default_rng(3)
     for task in TASKS[1:]:
         v = generators(size[0].numpy(), 0.5, task)
         h, e = double_description(v)
-        f, eq = acceleration_constraints(
-            task,
-            torch.tensor(h)[None],
-            torch.tensor(e)[None],
-            c,
-            inertia,
-            mass,
-            zero,
-            gravity,
-            zero,
-            zero,
-            size,
-            eye,
-            zero,
-            torch.tensor([False]),
-        )
-        assert eq.shape[1] == (0 if task == "tipping" else 2)
         uv = {
             "sliding": np.array([1.0, 0, 0]),
             "tipping": np.array([0.1, 0, 0.08]),
@@ -79,11 +65,34 @@ def test_scalar_elimination_matches_lifted_dynamics():
             "tipping": np.array([0.0, 1, 0]),
             "twisting": np.array([0.0, 0, 1]),
         }[task]
+        f, eq = acceleration_constraints(
+            task,
+            torch.tensor(h)[None],
+            torch.tensor(e)[None],
+            c,
+            inertia,
+            mass,
+            zero,
+            gravity,
+            torch.tensor(speed * uv)[None],
+            torch.tensor(speed * uw)[None],
+            size,
+            eye,
+            zero,
+            torch.tensor([startup]),
+            dt=dt,
+        )
+        assert eq.shape[1] == (0 if task == "tipping" else 2)
+        # Independent lifted Newton-Euler model, including the tipping centripetal term.
+        ar = np.cross(uw, uv) * (0 if startup else speed**2)
+        force = mass.item() * (ar - gravity[0].numpy())
+        b = np.r_[np.cross(c[0].numpy(), force), force]
+        lower = -speed / (2 * dt)
         d = np.r_[inertia[0].numpy() @ uw + mass.item() * np.cross(c[0], uv), mass.item() * uv]
         for _ in range(15):
             # Include feasible samples by constructing chi from the lifted system.
             chi = np.linalg.solve(
-                bmat, v @ rng.uniform(0, 1, v.shape[1]) - d * rng.uniform(0, 3) - b
+                bmat, v @ rng.uniform(0, 1, v.shape[1]) - d * (lower + rng.uniform(-1, 3)) - b
             )
             if rng.random() < 0.5:
                 chi += rng.normal(0, 1, 6)
@@ -91,7 +100,7 @@ def test_scalar_elimination_matches_lifted_dynamics():
                 np.zeros(v.shape[1] + 1),
                 A_eq=np.column_stack((v, -d)),
                 b_eq=bmat @ chi + b,
-                bounds=(0, None),
+                bounds=[(0, None)] * v.shape[1] + [(lower, None)],
                 method="highs",
             ).success
             x = np.r_[chi, 1]
@@ -100,12 +109,19 @@ def test_scalar_elimination_matches_lifted_dynamics():
 
 
 def test_margin_and_projection_on_affine_halfspace():
-    # x0 <= 0, x1 = 0 in normalized coordinates, with the [-1,1] action box.
+    # x0 <= 0, x1 = 0 in fixed metric coordinates; the enlarged box is [-2,2].
     inequalities = torch.tensor([[[1 / 30, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
     eq = torch.tensor([[[0.0, 1 / 30, 0.0, 0.0, 0.0, 0.0, 0.0]]])
-    margin, distance = measures(inequalities, eq, torch.tensor([[0.3, 0.4, 0, 0, 0, 0.0]]), 256)
+    margin, distance = measures(inequalities, eq, torch.tensor([[0.15, 0.2, 0, 0, 0, 0.0]]), 256)
     torch.testing.assert_close(margin, torch.tensor([-0.3]), atol=1e-5, rtol=0)
     torch.testing.assert_close(distance, torch.tensor([0.5]), atol=1e-4, rtol=0)
-    margin, distance = measures(inequalities, eq, torch.tensor([[-0.3, 0, 0, 0, 0, 0.0]]))
+    margin, distance = measures(inequalities, eq, torch.tensor([[-0.15, 0, 0, 0, 0, 0.0]]))
     torch.testing.assert_close(margin, torch.tensor([0.3]), atol=1e-5, rtol=0)
     torch.testing.assert_close(distance, torch.tensor([0.0]), atol=1e-5, rtol=0)
+
+
+def test_expanded_action_box_uses_original_margin_units():
+    empty = torch.zeros(1, 0, 7)
+    margin, distance = measures(empty, empty, torch.tensor([[0.75, 0, 0, 0, 0, 0.0]]))
+    torch.testing.assert_close(margin, torch.tensor([0.5]))
+    torch.testing.assert_close(distance, torch.tensor([0.0]))

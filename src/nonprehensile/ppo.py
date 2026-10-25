@@ -69,6 +69,7 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
         device,
     )
     successes, times, failures, mapping_failures = [], [], [], []
+    mode_errors, contact_gaps = [], []
     violations, transitions = torch.zeros((), device=device), torch.zeros((), device=device)
     with torch.inference_mode():
         for batch in range((episodes + env.n - 1) // env.n):
@@ -78,6 +79,7 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
             obs = env.observe()
             alive = torch.arange(env.n, device=device) < min(env.n, episodes - batch * env.n)
             success, duration, failure, mapping_failure = [env.zeros() for _ in range(4)]
+            max_error, max_gap = env.zeros(), env.zeros()
             for _ in range(250):
                 mean, _ = policy(obs)
                 action, invalid = execute_action(policy, env, mean)
@@ -86,6 +88,10 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
                 violations += ((violated | invalid) & alive).sum()
                 transitions += alive.sum()
                 obs, _, done, info = env.step(action, invalid)
+                max_error = torch.where(
+                    alive, torch.maximum(max_error, info["mode_error"]), max_error
+                )
+                max_gap = torch.where(alive, torch.maximum(max_gap, info["contact_gap"]), max_gap)
                 first = alive & done
                 success[first] = info["success"][first].float()
                 duration[first] = info["time"][first]
@@ -96,6 +102,8 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
             times.append(duration.cpu())
             failures.append(failure.cpu())
             mapping_failures.append(mapping_failure.cpu())
+            mode_errors.append(max_error.cpu())
+            contact_gaps.append(max_gap.cpu())
     success = torch.cat(successes)[:episodes].float()
     duration = torch.cat(times)[:episodes]
     fail = torch.cat(failures)[:episodes].float()
@@ -108,6 +116,8 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
         physical_failure_rate=fail.mean().item(),
         mapping_failure_rate=torch.cat(mapping_failures)[:episodes].mean().item(),
         constraint_violation_rate=(violations / transitions.clamp_min(1)).item(),
+        mean_episode_max_mode_error=torch.cat(mode_errors)[:episodes].mean().item(),
+        mean_episode_max_contact_gap=torch.cat(contact_gaps)[:episodes].mean().item(),
         disturbance=noise,
     )
     return result

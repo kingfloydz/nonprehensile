@@ -1,10 +1,12 @@
-"""Pull back DD contact constraints, eliminate beta >= 0, measure geometry."""
+"""Pull back DD contact constraints with a one-step directional speed bound."""
 
 import torch
 
 from .math import mv, skew
 
-SCALE = (30.0, 30.0, 30.0, 15.0, 15.0, 15.0)
+# Policy actions are in [-1, 1]; reward geometry keeps its original physical units.
+SCALE = (60.0, 60.0, 60.0, 30.0, 30.0, 30.0)
+METRIC_SCALE = (30.0, 30.0, 30.0, 15.0, 15.0, 15.0)
 
 
 def acceleration_constraints(
@@ -22,7 +24,10 @@ def acceleration_constraints(
     object_rotation,
     origin,
     startup,
+    dt=0.02,
 ):
+    if dt <= 0:
+        raise ValueError("The control period must be positive")
     n = c.shape[0]
     eye = torch.eye(3, device=c.device, dtype=c.dtype).expand(n, 3, 3)
     zero = torch.zeros_like(c)
@@ -88,7 +93,16 @@ def acceleration_constraints(
         # One mode acceleration is determined by a contact-cone equality.
         beta = -(ed[:, :, None] * ew).sum(1) / ed.square().sum(1, keepdim=True)
         corrected = wmap + direction[:, :, None] * beta[:, None, :]
-        inequalities = torch.cat((h @ corrected, -beta[:, None]), 1)
+        # beta >= -v_parallel/(2*dt). Use measured signed speed even when E
+        # approximates the startup dynamics with zero relative velocity.
+        speed = (
+            relative_velocity[:, 0]
+            if task == "sliding"
+            else relative_omega[:, 1 if task == "tipping" else 2]
+        )
+        direction_bound = -beta.clone()
+        direction_bound[:, 6] -= speed / (2 * dt)
+        inequalities = torch.cat((h @ corrected, direction_bound[:, None]), 1)
         # Remove the consumed equality explicitly, rather than retaining a row
         # of roundoff errors that pinv could mistake for a physical constraint.
         left, _, _ = torch.linalg.svd(ed[:, :, None], full_matrices=True)
@@ -99,16 +113,19 @@ def acceleration_constraints(
 def measures(inequalities, equalities, action, iterations=48):
     """Relative slack and fixed-iteration Euclidean projection distance.
 
-    Coordinates are normalized by the physical action bounds. FISTA solves the
+    Coordinates use fixed METRIC_SCALE units, independently of action bounds.
+    The input action is policy-normalized by SCALE. FISTA solves the
     halfspace projection dual on GPU; no per-world optimizer or host synchronization.
     """
     n = action.shape[0]
-    scale = action.new_tensor(SCALE)
+    scale = action.new_tensor(METRIC_SCALE)
+    bounds = action.new_tensor(SCALE) / scale
+    action = action * bounds
     eye = torch.eye(6, device=action.device).expand(n, 6, 6)
     a = inequalities[:, :, :6] * scale
     b = -inequalities[:, :, 6]
     a = torch.cat((a, eye, -eye), 1)
-    b = torch.cat((b, torch.ones((n, 12), device=action.device)), 1)
+    b = torch.cat((b, bounds.repeat(2).expand(n, 12)), 1)
     if equalities.shape[1]:
         eq = equalities[:, :, :6] * scale
         rhs = -equalities[:, :, 6]

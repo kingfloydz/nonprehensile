@@ -26,20 +26,32 @@ from .bank import TASKS, build
 from .env import EnvConfig
 
 
-def grid(group):
+def grid(task, group):
+    """26 fixed-task candidates; zero-success tasks use diagnostic defaults."""
     if group == "A":
         return [{}]
     if group == "B":
-        return [dict(conventional_weight=w) for w in (0.1, 1.0, 10.0)]
+        return [dict(conventional_weight=1.0 if task == "sliding" else 0.1)]
     if group == "C":
-        return [dict(distance_weight=w) for w in (0.1, 1.0, 10.0)]
-    weights = [
-        dict(distance_weight=d, margin_weight=m)
-        for d, m in itertools.product((0.1, 1.0, 10.0), (0.01, 0.1, 1.0))
-    ]
+        return [dict(distance_weight=10.0 if task == "sliding" else 1.0)]
     if group == "D":
-        return weights
-    return [dict(w, startup_weight=s) for w in weights for s in (0.3, 1.0, 3.0)]
+        return [
+            dict(distance_weight=10.0 if task == "sliding" else 1.0, margin_weight=m)
+            for m in ((0.1, 1.0) if task == "sliding" else (0.1,))
+        ]
+    if group != "E":
+        raise ValueError("Only A-E have reward search grids")
+    if task == "sticking":
+        return []
+    if task == "twisting":
+        return [dict(distance_weight=1.0, margin_weight=0.01, startup_weight=0.3)]
+    margins, startups = (
+        ((0.01, 1.0), (0.3, 3.0)) if task == "sliding" else ((0.01, 0.1), (1.0, 3.0))
+    )
+    return [
+        dict(distance_weight=10.0, margin_weight=m, startup_weight=s)
+        for m, s in itertools.product(margins, startups)
+    ]
 
 
 def configuration(task, group, num_envs, iterations, **weights):
@@ -83,7 +95,7 @@ def run(
         for group in dict.fromkeys(groups):
             if group == "F" or (task == "sticking" and group == "E"):
                 continue
-            for index, weights in enumerate(grid(group)):
+            for index, weights in enumerate(grid(task, group)):
                 directory = root / "search" / task / group / f"{index:03d}"
                 directory.mkdir(parents=True, exist_ok=True)
                 config = configuration(task, group, num_envs, search_iterations, **weights)
@@ -172,6 +184,13 @@ def run(
             cfg["ppo"]["validation_episodes"] = 4096
             (destination / "config.json").write_text(json.dumps(cfg, indent=2))
             shutil.copy2(winner / "validation.json", destination / "selection_validation.json")
+            winner_score = score(winner)
+            selection = dict(
+                task_solved=winner_score[0] > 0,
+                tied_candidates=sum(score(p) == winner_score for p in candidates),
+                rule="success_rate, then penalized_time; first candidate breaks exact ties",
+            )
+            (destination / "selection.json").write_text(json.dumps(selection, indent=2))
             (destination / "selected_from.txt").write_text(str(winner))
             selected.append(destination)
     with ThreadPoolExecutor(max_workers=len(gpus)) as pool:
@@ -190,6 +209,8 @@ def run(
                 "physical_failure_rate",
                 "mapping_failure_rate",
                 "constraint_violation_rate",
+                "mean_episode_max_mode_error",
+                "mean_episode_max_contact_gap",
                 "disturbance",
             ],
         )

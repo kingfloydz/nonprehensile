@@ -33,7 +33,7 @@ paths are resolved against the working directory. Training and test subprocesses
 use the same Python interpreter as the pipeline (`sys.executable`). With the
 dependencies already installed in system Python, editable installation is optional.
 
-The full pipeline performs **145 search runs + 23 final runs**. Sticking E is omitted
+The full pipeline performs **26 search runs + 23 final runs**. Sticking E is omitted
 because it has no startup transition and would duplicate D. Each PPO iteration
 contains `32 * num_envs` transitions. Weight selection uses highest validation
 success rate, then lowest failure-penalized time; never shaped training return.
@@ -48,6 +48,11 @@ Use `--groups A F` for the task-only baseline versus F, or `--groups A B C D E`
 to retain only the original ablations.
 The default search/final budgets are intentionally configurable. "Best" means
 best on validation among the searched candidates, not globally optimal weights.
+`selection.json` records whether any task was solved and how many candidates tied.
+A zero-success selection is a diagnostic default, not evidence of optimal weights.
+Tasks and goals are fixed from the start: there is no curriculum or extra scene.
+Use a fresh output root for this revision; old action scales and results are not
+directly comparable, and old policies must be retrained.
 
 Outputs:
 
@@ -71,6 +76,11 @@ include normalized acceleration noise standard deviations 0, .01, .03, .05.
 and before terminal/reset transitions, using normalized halfspaces/equalities
 with tolerance 1e-4. `mapping_failure_rate` is the fraction of episodes terminated
 by an unverified teacher mapping; it is separate from physical failures.
+`mean_episode_max_mode_error` reports the mean per-episode maximum normalized
+unwanted-motion error (the original 3 mm / 3 degree reward units).
+`mean_episode_max_contact_gap` reports mean per-episode maximum positive original
+bottom-corner height in meters, sampled at control boundaries before reset. It is
+a separation diagnostic, not a contact-force certificate or a substep flight test.
 
 ## Experiment
 
@@ -81,11 +91,11 @@ by an unverified teacher mapping; it is separate from physical failures.
 | Box height | U(0.05, 0.40) m |
 | Static = kinetic friction | U(0.10, 0.80) |
 | Density | 500 kg/m^3; mass and inertia change with dimensions |
-| Action | six tray accelerations, each angular component +/-30 rad/s^2, linear +/-15 m/s^2 |
-| Tray speed | <=2 m/s, angular speed <=3 rad/s; exceeding a limit terminates the episode |
+| Action | six tray accelerations, each angular component +/-60 rad/s^2, linear +/-30 m/s^2 |
+| Tray speed | <=5 m/s, angular speed <=10 rad/s; exceeding a limit terminates the episode |
 | Control / physics | 20 ms / 1 ms |
 | Timeout | 5 s |
-| Relative acceleration | beta >= 0 for all moving-mode analytic sets |
+| Relative acceleration | beta >= -v_parallel/(2 dt), using the 20 ms control period |
 
 Each split contains independent uniform samples of dimensions and friction.
 An episode samples a row from its split's **finite randomized bank**, rather than
@@ -103,11 +113,22 @@ Increase `--bank-size` for wider empirical coverage. Banks are disjoint by RNG s
 All start at relative rest. Sliding starts at x=-0.1 m and ends at x=+0.1 m;
 tipping also starts at x=-0.1 m to leave room in its falling direction.
 The selected task fixes direction; policies are trained independently per task.
-Sliding/twisting end at first passage, **not at rest**, because beta >= 0 excludes
-braking. Tipping ends at first new-face contact; post-impact settling is not scored.
+Sliding/twisting end at first passage, **not at rest**. The directional bound allows
+braking while predicting at least half the current signed speed at the next control
+step; it does not guarantee the independent simulator follows that prediction.
+At rest the bound is beta >= 0, so it does not force startup. Tipping ends at first
+new-face contact; post-impact settling is not scored. Tipping checks outcomes every
+1 ms and latches the first success or failure, with failure winning simultaneous
+events. Event time and error are retained even if impact causes a later rebound.
+The vectorized simulation finishes the control step before terminal worlds reset.
 All tasks reject separation, tray-speed violations, and leaving the tray.
-Motion tolerances are 3 mm and 3 degrees; the sticking endpoint tolerance is 5 mm
+Motion failure tolerances are 10 mm and 10 degrees; the sticking endpoint tolerance is 5 mm
 with speeds below .03 m/s and .10 rad/s.
+The separation threshold remains 8 mm; small positive gaps can still pass it and
+are reported separately. Reverse-motion thresholds remain -.03 m/s / -.10 rad/s.
+Speed limits are terminal checks, not additional rows in the contact polyhedron;
+the teacher does not certify trajectory-level speed safety. `EnvConfig` exposes
+the translation/rotation tolerances and tray linear/angular speed limits.
 
 ## Rewards
 
@@ -121,17 +142,34 @@ Physics costs are multiplied by dt, preventing dependence on reward sampling rat
 | Group | Additional penalty | Search weights |
 |---|---|---|
 | A | none | one setting |
-| B | normalized unwanted translation/rotation | conventional: .1, 1, 10 |
-| C | distance^2, after entering the moving mode | distance: .1, 1, 10 |
-| D | C + softplus((.05 - relative_margin)/.05) | distance: .1, 1, 10; margin: .01, .1, 1 |
-| E | D + startup-branch cost continuously until physical mode entry | D grid x startup multiplier: .3, 1, 3 |
+| B | normalized unwanted translation/rotation | task-specific fixed weight below |
+| C | distance^2, after entering the moving mode | task-specific fixed weight below |
+| D | C + softplus((.05 - relative_margin)/.05) | reduced task-specific candidates below |
+| E | D + startup-branch cost continuously until physical mode entry | reduced task-specific candidates below |
 | F | none; constrain teacher actions, then distill | no reward-weight search |
+
+The reduced grid uses prior validation results to prioritize sliding and tipping-E.
+Zero-success tasks use fixed diagnostic settings, not claimed optima. All numbers
+are revalidated under the relaxed environment. Tuples below are `(distance, margin)`
+for D and `(distance, margin, startup)` for E; braces denote Cartesian products.
+
+| Task | B | C | D | E | Candidates including A |
+|---|---|---|---|---|---|
+| sticking | .1 | 1 | (1, .1) | omitted | 4 |
+| sliding | 1 | 10 | (10, {.1, 1}) | (10, {.01, 1}, {.3, 3}) | 9 |
+| tipping | .1 | 1 | (1, .1) | (10, {.01, .1}, {1, 3}) | 8 |
+| twisting | .1 | 1 | (1, .1) | (1, .01, .3) | 5 |
+
+The task reward, goal tolerances, observation scales, PPO settings and reward
+normalizations remain fixed. In particular, B's error uses the original 3 mm /
+3 degree scales, independently of the relaxed failure tolerances.
 
 For sticking, C/D apply immediately. E uses the zero-relative-velocity startup
 branch before entry, then the mode-interior branch. Entry is latched from measured
 positive relative speed (> .02 m/s sliding, > .10 rad/s tipping/twisting), not from
 analytic feasibility. These thresholds operationalize the near-rest startup state.
-Beta=0 is deliberately included; startup feasibility alone does not force entry.
+The directional speed bound always uses measured signed speed, including during
+E's zero-velocity startup approximation; at exact rest beta=0 is included.
 The task's time/success reward must still encourage starting and finishing.
 
 ## Shared observation (36 dimensions)
@@ -169,7 +207,7 @@ Previous **46-input checkpoints require retraining**.
 For each state, include the action bounds in the normalized acceleration set:
 
 $$\mathcal P=\{z:Az\le b,\ Ez=e,\ -1\le z\le1\},\qquad
-\chi=\operatorname{diag}(30,30,30,15,15,15)z.$$
+\chi=\operatorname{diag}(60,60,60,30,30,30)z.$$
 
 Compute an orthonormal nullspace basis $Q$ of $E$ and a verified relative-interior
 point $z_0$. With $G=AQ$ and $h=b-Az_0>0$ on nonconstant rows, use
@@ -219,7 +257,7 @@ Deployment requires only the exported actor, with **no feasible-set mapping**:
 actor = torch.jit.load("student_actor.pt", map_location="cuda:0")
 with torch.inference_mode():
     normalized_action = actor(observation)  # [batch, 36] -> [batch, 6]
-    acceleration = normalized_action * observation.new_tensor([30, 30, 30, 15, 15, 15])
+    acceleration = normalized_action * observation.new_tensor([60, 60, 60, 30, 30, 30])
 ```
 
 The student has no hard feasibility guarantee. The teacher's certificate is an
@@ -245,11 +283,24 @@ uses the four-vertex contact approximation, not an exact continuous pressure mod
 
 At runtime the wrench cone is shifted/rotated and pulled back through Newton-Euler
 dynamics. For these models a contact-cone equality uniquely determines the scalar
-beta. Eliminating it algebraically and adding beta>=0 is equivalent to projecting
-`cone[V,-D]`, without rerunning double description for every GPU world/time step.
+beta. Eliminate it algebraically and impose
+
+$$\beta\ge -\frac{v_\parallel}{2\Delta t},\qquad
+v_\parallel^+=v_\parallel+\beta\Delta t\ge\tfrac12v_\parallel.$$
+
+Use tray-frame relative x velocity for sliding, relative y angular velocity for
+tipping, and relative z angular velocity for twisting. Direction preservation
+assumes the current signed speed is nonnegative. For each fixed state this is an
+affine halfspace. Equivalently, substitute
+`beta = gamma - v_parallel/(2 dt)`, `gamma >= 0`, in the lifted wrench equations
+and project the translated cone; no repeated double description is needed.
 Action bounds are included in the final acceleration polyhedron.
 
-Relative margin uses the normalized affine-hull projector and facet slacks.
+Relative margin uses the affine-hull projector and facet slacks in fixed physical
+metric coordinates `chi / (30,30,30,15,15,15)`. Those units do not expand with the
+action box: policy actions `z` map to metric coordinates `2*z`, whose box is now
+`[-2,2]^6`. Thus doubling action bounds does not halve distance or margin penalties
+at a fixed physical displacement. Teacher mapping uses policy coordinates instead.
 Distance uses **48 fixed FISTA iterations** for the convex projection dual: it is
 a numerical approximation, not an exact signed-distance formula. Iterations are
 configurable in `EnvConfig`. Equality-normal distance is handled separately.
@@ -289,7 +340,8 @@ pytest tests -q
 
 The mathematical tests compare DD membership, scalar elimination and gauge-map
 relative feasibility against independent linear programs; they also check inverse
-mapping, invalid-set rejection and batch independence. Physics tests check
+mapping, nonzero-speed braking bounds, fixed reward units, invalid-set rejection,
+batch independence and first-event ordering. Physics tests check
 world-frame free fall, observation frames, failure resets, and a small real-physics
 PPO → BC → DAgger → exported-student run. H200 throughput and
 policy learning results must be measured on the training server; no trained

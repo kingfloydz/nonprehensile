@@ -45,8 +45,8 @@ def test_mapping_rejects_empty_rank_change_and_collapsed_sets():
     # x0 <= -2 contradicts the action box; x0=0 encoded as two inequalities
     # has no interior in the declared affine hull. Neither may silently pass.
     f = torch.zeros(3, 2, 7)
-    f[0, 0, 0], f[0, 0, 6] = 1 / 30, 2
-    f[1, :, 0] = torch.tensor([1 / 30, -1 / 30])
+    f[0, 0, 0], f[0, 0, 6] = 1 / SCALE[0], 2
+    f[1, :, 0] = torch.tensor([1 / SCALE[0], -1 / SCALE[0]])
     f[2, 0, 6] = 1  # impossible constant row 0 <= -1
     mapping = GaugeMap(f, f[:, :0])
     _, invalid = mapping(torch.zeros(3, 6))

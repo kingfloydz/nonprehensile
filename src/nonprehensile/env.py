@@ -42,6 +42,10 @@ class EnvConfig:
     mapping_iterations: int = 32
     disturbance: float = 0.0
     discount: float = 0.99
+    translation_tolerance: float = 0.01
+    rotation_tolerance: float = float(np.deg2rad(10))
+    tray_speed_limit: float = 5.0
+    tray_angular_speed_limit: float = 10.0
 
 
 class TrayEnv:
@@ -207,11 +211,19 @@ class TrayEnv:
             rot,
             self.origin,
             startup,
+            dt=self.dt,
         )
 
     def physics(self, chi):
         alpha, accel = chi[:, :3], chi[:, 3:]
-        for _ in range(self.substeps):
+        # Tipping ends at first new-face contact, before post-impact rebound.
+        # Latch the first terminal event (failure wins simultaneous events).
+        event_success = torch.zeros_like(self.entered)
+        event_failure = torch.zeros_like(self.entered)
+        event_started = torch.zeros_like(self.entered)
+        event_error = self.zeros()
+        event_time = (self.steps + 1).float() * self.dt
+        for substep in range(self.substeps):
             c, rot, vr, wr, gravity, inertia = self.state()
             omega = self.omega
             total = omega + wr
@@ -229,6 +241,20 @@ class TrayEnv:
             self.quaternion = quat_step(self.quaternion, omega + alpha * 0.0005, 0.001)
             self.omega += alpha * 0.001
             self.sim.step()
+            if self.cfg.task == "tipping":
+                success, failure, started, error = self.outcomes()
+                active = ~(event_success | event_failure)
+                first = active & (success | failure)
+                event_error = torch.where(active, error, event_error)
+                event_started |= active & started
+                event_success |= first & success
+                event_failure |= first & failure
+                event_time = torch.where(
+                    first, self.steps.float() * self.dt + (substep + 1) * 0.001, event_time
+                )
+        if self.cfg.task == "tipping":
+            return event_success, event_failure, event_started, event_error, event_time
+        return None
 
     def outcomes(self):
         c, rot, vr, wr, _, _ = self.state()
@@ -238,21 +264,24 @@ class TrayEnv:
         tilt = torch.acos(rot[:, 2, 2].clamp(-1, 1))
         yaw = torch.atan2(rot[:, 1, 0], rot[:, 0, 0])
         pitch = torch.atan2(rot[:, 0, 2], rot[:, 0, 0])
+        pos_tol, angle_tol = self.cfg.translation_tolerance, self.cfg.rotation_tolerance
         if task == "sticking":
             error = delta[:, :2].norm(dim=-1) / 0.003 + angle / 0.05236
-            mode_fail = (delta[:, :2].norm(dim=-1) > 0.003) | (angle > 0.05236)
+            mode_fail = (delta[:, :2].norm(dim=-1) > pos_tol) | (angle > angle_tol)
             target = c.new_tensor([0.5, 0.0, 0.0])
             success = (self.position - target).norm(dim=-1) < 0.005
             success &= (self.velocity.norm(dim=-1) < 0.03) & (self.omega.norm(dim=-1) < 0.1)
             started = torch.ones_like(success)
         elif task == "sliding":
             error = delta[:, 1].abs() / 0.003 + angle / 0.05236
-            mode_fail = (delta[:, 1].abs() > 0.003) | (angle > 0.05236) | (vr[:, 0] < -0.03)
+            mode_fail = (delta[:, 1].abs() > pos_tol) | (angle > angle_tol) | (vr[:, 0] < -0.03)
             success = delta[:, 0] >= 0.2
             started = vr[:, 0] > 0.02
         elif task == "twisting":
             error = delta[:, :2].norm(dim=-1) / 0.003 + tilt / 0.05236
-            mode_fail = (delta[:, :2].norm(dim=-1) > 0.003) | (tilt > 0.05236) | (wr[:, 2] < -0.1)
+            mode_fail = (
+                (delta[:, :2].norm(dim=-1) > pos_tol) | (tilt > angle_tol) | (wr[:, 2] < -0.1)
+            )
             success = yaw >= torch.pi / 2
             started = wr[:, 2] > 0.1
         else:
@@ -268,20 +297,26 @@ class TrayEnv:
             )
             axis_error = torch.acos(rot[:, 1, 1].clamp(-1, 1))
             error = slip / 0.003 + axis_error / 0.05236
-            mode_fail = (slip > 0.003) | (axis_error > 0.05236) | (wr[:, 1] < -0.1)
+            mode_fail = (slip > pos_tol) | (axis_error > angle_tol) | (wr[:, 1] < -0.1)
             local[:, 2] *= -1
             next_edge = c + mv(rot, local)
             success = (pitch > torch.pi / 2 - 0.05236) & (next_edge[:, 2].abs() < 0.002)
             started = wr[:, 1] > 0.1
+        separation = self.contact_gap(c, rot) > 0.008
+        limits = (self.velocity.norm(dim=-1) > self.cfg.tray_speed_limit) | (
+            self.omega.norm(dim=-1) > self.cfg.tray_angular_speed_limit
+        )
+        outside = (c[:, :2].abs() > 0.4).any(1)
+        failed = mode_fail | separation | limits | outside
+        return success & ~failed, failed, started, error
+
+    def contact_gap(self, c, rot):
+        """Minimum original bottom-corner height; diagnostic, not a force test."""
         corners = c.new_tensor([[-1, -1, -1], [-1, 1, -1], [1, -1, -1], [1, 1, -1]])
         bottom = c[:, None] + torch.einsum(
             "nij,nkj->nki", rot, corners[None] * self.size[:, None] / 2
         )
-        separation = bottom[:, :, 2].amin(1) > 0.008
-        limits = (self.velocity.norm(dim=-1) > 2.0) | (self.omega.norm(dim=-1) > 3.0)
-        outside = (c[:, :2].abs() > 0.4).any(1)
-        failed = mode_fail | separation | limits | outside
-        return success & ~failed, failed, started, error
+        return bottom[:, :, 2].amin(1)
 
     def potential(self):
         """Shared goal shaping; terminal potential is zero in every group."""
@@ -322,9 +357,13 @@ class TrayEnv:
             margin, distance = measures(
                 inequalities, equalities, applied, self.cfg.projection_iterations
             )
-        self.physics(applied * self.scale)
+        events = self.physics(applied * self.scale)
         self.steps += 1
-        success, failure, started, error = self.outcomes()
+        if events is None:
+            success, failure, started, error = self.outcomes()
+            duration = self.steps.float() * self.dt
+        else:
+            success, failure, started, error, duration = events
         success &= ~invalid
         physical_failure = failure & ~invalid
         failure |= invalid
@@ -350,11 +389,13 @@ class TrayEnv:
         info = dict(
             success=success.clone(),
             failure=failure.clone(),
-            time=self.steps.float() * self.dt,
+            time=duration,
             margin=margin,
             distance=distance,
             mapping_failure=invalid.clone(),
             physical_failure=physical_failure,
+            mode_error=error.clone(),
+            contact_gap=self.contact_gap(*self.state()[:2]),
         )
         # Return terminal outcomes while resetting completed worlds for the next action.
         ids = done.nonzero().flatten()
