@@ -6,24 +6,10 @@ import torch
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
-from .geometry import SCALE, acceleration_constraints, measures
+from .geometry import acceleration_constraints, measures
 from .math import mv, quat_step, rotation
-
-XML = """
-<mujoco model="accelerating_tray">
-  <option timestep="0.001" gravity="0 0 0" cone="elliptic"/>
-  <default><geom condim="3" solref="0.004 1" solimp="0.95 0.99 0.001"/></default>
-  <worldbody>
-    <geom name="tray" type="box" pos="0 0 -0.01" size="0.4 0.4 0.01"
-          friction="0.8 0 0" rgba="0.25 0.4 0.55 1"/>
-    <body name="box" pos="0 0 0.1">
-      <freejoint/>
-      <geom name="payload" type="box" size="0.1 0.1 0.1" density="500"
-            priority="1" friction="0.5 0 0" rgba="0.85 0.5 0.2 1"/>
-    </body>
-  </worldbody>
-</mujoco>
-"""
+from .model import XML
+from .settings import BENCHMARK_VERSION, METRIC_SCALE, SETTINGS
 
 
 @dataclass
@@ -41,11 +27,42 @@ class EnvConfig:
     projection_iterations: int = 48
     mapping_iterations: int = 32
     disturbance: float = 0.0
-    discount: float = 0.99
-    translation_tolerance: float = 0.01
-    rotation_tolerance: float = float(np.deg2rad(10))
-    tray_speed_limit: float = 5.0
-    tray_angular_speed_limit: float = 10.0
+    discount: float = 0.99**0.25
+    translation_tolerance: float = 0.001
+    rotation_tolerance: float = float(np.deg2rad(1))
+    gap_tolerance: float = 0.0005
+    min_normal_load: float = 0.1  # 20 ms average, in units of mg
+    tray_speed_limit: float | None = None
+    tray_angular_speed_limit: float | None = None
+    action_limits: tuple | None = None
+    goal: float | None = None
+    control_dt: float = 0.005
+    physics_dt: float = 0.00025
+    timeout_s: float = 5.0
+    benchmark_version: str = BENCHMARK_VERSION
+
+    def __post_init__(self):
+        if self.benchmark_version != BENCHMARK_VERSION:
+            raise ValueError("Benchmark version mismatch; rebuild banks and retrain.")
+        spec = SETTINGS[self.task]
+        for name, value in (
+            ("goal", spec.goal),
+            ("action_limits", spec.action_limits),
+            ("tray_speed_limit", spec.speed_limit),
+            ("tray_angular_speed_limit", spec.angular_speed_limit),
+        ):
+            if getattr(self, name) is None:
+                setattr(self, name, value)
+        if self.physics_dt <= 0 or self.control_dt < self.physics_dt:
+            raise ValueError("Require 0 < physics_dt <= control_dt")
+        if not np.isclose(
+            self.control_dt / self.physics_dt, round(self.control_dt / self.physics_dt)
+        ):
+            raise ValueError("control_dt must be a multiple of physics_dt")
+        if len(self.action_limits) != 6 or min(self.action_limits) <= 0:
+            raise ValueError("Six positive acceleration limits are required")
+        if self.timeout_s <= 0 or self.goal <= 0:
+            raise ValueError("Timeout and goal must be positive")
 
 
 class TrayEnv:
@@ -56,17 +73,31 @@ class TrayEnv:
     commanded tray acceleration. No artificial contact or mode enforcement.
     """
 
-    dt = 0.02
-    substeps = 20
+    @property
+    def dt(self):
+        return self.cfg.control_dt
+
+    @property
+    def substeps(self):
+        return round(self.dt / self.cfg.physics_dt)
+
+    @property
+    def max_steps(self):
+        return int(np.ceil(self.cfg.timeout_s / self.dt))
 
     def __init__(self, cfg, bank, device="cuda:0"):
         self.cfg, self.device, self.n = cfg, device, cfg.num_envs
         self.rng = torch.Generator(device=device).manual_seed(cfg.seed)
         self.noise_rng = torch.Generator(device=device).manual_seed(cfg.seed + 1000)
         with np.load(bank) as data:
+            if (
+                "benchmark_version" not in data
+                or str(data["benchmark_version"]) != cfg.benchmark_version
+            ):
+                raise ValueError("Old or incompatible bank; rebuild with the current settings")
             self.bank = {
-                k: torch.tensor(data[k], device=device)
-                for k in ("size", "mu", cfg.task + "_h", cfg.task + "_e")
+                k: torch.tensor(data[f"{cfg.task}_{k}"], device=device)
+                for k in ("size", "mu", "h", "e", "qpos", "quaternion")
             }
         model = mujoco.MjModel.from_xml_string(XML)
         self.sim = Simulation(
@@ -75,7 +106,7 @@ class TrayEnv:
                 nconmax=16,
                 njmax=64,
                 mujoco=MujocoCfg(
-                    timestep=0.001,
+                    timestep=cfg.physics_dt,
                     gravity=(0.0, 0.0, 0.0),
                     cone="elliptic",
                     iterations=30,
@@ -107,21 +138,28 @@ class TrayEnv:
         self.origin = self.zeros(3)
         self.entered = torch.zeros(self.n, dtype=torch.bool, device=device)
         self.steps = torch.zeros(self.n, dtype=torch.long, device=device)
-        self.scale = torch.tensor(SCALE, device=device)
+        self.scale = torch.tensor(cfg.action_limits, device=device)
+        self.load_history = self.zeros(max(1, round(0.02 / cfg.physics_dt)))
+        self.load_cursor = 0
+        self.normal_fraction = self.zeros()
+        self.last_gap = self.zeros()
+        self.last_no_contact = torch.zeros(self.n, dtype=torch.bool, device=device)
         self.all_ids = torch.arange(self.n, device=device)
         self.reset(self.all_ids)
 
     def zeros(self, *shape):
         return torch.zeros((self.n, *shape), device=self.device)
 
-    def reset(self, ids):
+    def reset(self, ids, bank_indices=None):
         count = len(ids)
-        indices = torch.randint(
-            len(self.bank["size"]), (count,), device=self.device, generator=self.rng
-        )
+        indices = bank_indices
+        if indices is None:
+            indices = torch.randint(
+                len(self.bank["size"]), (count,), device=self.device, generator=self.rng
+            )
         self.bank_ids[ids] = indices
         size = self.bank["size"][indices]
-        mass = 500 * size.prod(-1)
+        mass = torch.ones(count, device=self.device)
         inertia = mass[:, None] / 12 * (size.square().sum(-1, keepdim=True) - size.square())
         self.size[ids], self.mass[ids], self.diagonal[ids] = size, mass, inertia
         self.mu[ids] = self.bank["mu"][indices]
@@ -133,15 +171,15 @@ class TrayEnv:
         self.sim.model.body_inertia[ids, 1] = inertia
         self.sim.reset(ids)
         qpos = self.sim.data.qpos
-        qpos[ids, :3] = 0
-        qpos[ids, 2] = size[:, 2] / 2
-        qpos[ids, 3:7] = qpos.new_tensor([1.0, 0, 0, 0])
-        if self.cfg.task in ("sliding", "tipping"):
-            qpos[ids, 0] = -0.1
+        qpos[ids] = self.bank["qpos"][indices]
         self.origin[ids] = qpos[ids, :3]
         self.origin[ids, 2] = 0
         self.position[ids], self.velocity[ids], self.omega[ids] = 0, 0, 0
-        self.quaternion[ids] = qpos.new_tensor([1.0, 0, 0, 0])
+        self.quaternion[ids] = self.bank["quaternion"][indices]
+        initial_load = rotation(self.quaternion[ids])[:, 2, 2]
+        self.load_history[ids] = initial_load[:, None]
+        self.normal_fraction[ids] = initial_load
+        self.last_gap[ids], self.last_no_contact[ids] = 0, False
         self.steps[ids], self.entered[ids] = 0, False
         self.sim.recompute_constants(RecomputeLevel.set_const)
         self.sim.forward()
@@ -160,18 +198,20 @@ class TrayEnv:
         c, r, vr, wr, g, _ = self.state()
         rt = rotation(self.quaternion).transpose(1, 2)
         goal = self.zeros(3)
+        target = self.cfg.goal
         if self.cfg.task == "sticking":
-            goal = mv(rt, c.new_tensor([0.5, 0, 0]) - self.position) / 0.5
+            goal = mv(rt, c.new_tensor([target, 0, 0]) - self.position) / target
         elif self.cfg.task == "sliding":
-            goal[:, 0] = (self.origin[:, 0] + 0.2 - c[:, 0]) / 0.2
+            goal[:, 0] = (self.origin[:, 0] + target - c[:, 0]) / target
         else:
             angle = (
                 torch.atan2(r[:, 0, 2], r[:, 0, 0])
                 if self.cfg.task == "tipping"
                 else torch.atan2(r[:, 1, 0], r[:, 0, 0])
             )
-            goal[:, 0] = 1 - angle / (torch.pi / 2)
-        low, high = c.new_tensor([0.06, 0.06, 0.05]), c.new_tensor([0.30, 0.30, 0.40])
+            goal[:, 0] = 1 - angle / target
+        spec = SETTINGS[self.cfg.task]
+        low, high = c.new_tensor(spec.size_low), c.new_tensor(spec.size_high)
         return torch.cat(
             (
                 c / 0.4,
@@ -182,10 +222,11 @@ class TrayEnv:
                 self.omega / 3,
                 g / 9.81,
                 2 * (self.size - low) / (high - low) - 1,
-                2 * (self.mu[:, None] - 0.1) / 0.7 - 1,
+                2 * (self.mu[:, None] - spec.friction[0]) / (spec.friction[1] - spec.friction[0])
+                - 1,
                 goal,
                 self.entered[:, None].float(),
-                self.steps[:, None] / 250,
+                self.steps[:, None] / self.max_steps,
             ),
             -1,
         )
@@ -198,8 +239,8 @@ class TrayEnv:
         ids, task = self.bank_ids, self.cfg.task
         return acceleration_constraints(
             task,
-            self.bank[task + "_h"][ids],
-            self.bank[task + "_e"][ids],
+            self.bank["h"][ids],
+            self.bank["e"][ids],
             c,
             inertia,
             self.mass,
@@ -216,13 +257,18 @@ class TrayEnv:
 
     def physics(self, chi):
         alpha, accel = chi[:, :3], chi[:, 3:]
-        # Tipping ends at first new-face contact, before post-impact rebound.
-        # Latch the first terminal event (failure wins simultaneous events).
+        # All modes latch their first event; later substeps cannot erase failures.
         event_success = torch.zeros_like(self.entered)
         event_failure = torch.zeros_like(self.entered)
         event_started = torch.zeros_like(self.entered)
         event_error = self.zeros()
         event_time = (self.steps + 1).float() * self.dt
+        peak_error, peak_gap = self.zeros(), self.zeros()
+        min_load = self.normal_fraction.clone()
+        no_contact = torch.zeros_like(self.entered)
+        peak_drop, event_velocity = self.zeros(), self.velocity.clone()
+        event_speed, event_spin = self.zeros(), self.zeros()
+        h = self.cfg.physics_dt
         for substep in range(self.substeps):
             c, rot, vr, wr, gravity, inertia = self.state()
             omega = self.omega
@@ -236,25 +282,52 @@ class TrayEnv:
             self.sim.data.qfrc_applied[:, :3] = self.mass[:, None] * fictitious
             self.sim.data.qfrc_applied[:, 3:] = mv(rot.transpose(1, 2), torque)
             world_accel = mv(rotation(self.quaternion), accel)
-            self.position += self.velocity * 0.001 + world_accel * 0.0000005
-            self.velocity += world_accel * 0.001
-            self.quaternion = quat_step(self.quaternion, omega + alpha * 0.0005, 0.001)
-            self.omega += alpha * 0.001
+            self.position += self.velocity * h + world_accel * (0.5 * h * h)
+            self.velocity += world_accel * h
+            self.quaternion = quat_step(self.quaternion, omega + alpha * (0.5 * h), h)
+            self.omega += alpha * h
             self.sim.step()
-            if self.cfg.task == "tipping":
-                success, failure, started, error = self.outcomes()
-                active = ~(event_success | event_failure)
-                first = active & (success | failure)
-                event_error = torch.where(active, error, event_error)
-                event_started |= active & started
-                event_success |= first & success
-                event_failure |= first & failure
-                event_time = torch.where(
-                    first, self.steps.float() * self.dt + (substep + 1) * 0.001, event_time
-                )
-        if self.cfg.task == "tipping":
-            return event_success, event_failure, event_started, event_error, event_time
-        return None
+            # The only constraints on the free box are tray contacts. Translational
+            # generalized constraint force is expressed in the tray coordinates.
+            load = self.sim.data.qfrc_constraint[:, 2].clamp_min(0) / (self.mass * 9.81)
+            self.load_history[:, self.load_cursor] = load
+            self.load_cursor = (self.load_cursor + 1) % self.load_history.shape[1]
+            self.normal_fraction = self.load_history.mean(1)
+            success, failure, started, error = self.outcomes()
+            active = ~(event_success | event_failure)
+            first = active & (success | failure)
+            peak_error = torch.where(active, torch.maximum(peak_error, error), peak_error)
+            peak_gap = torch.where(active, torch.maximum(peak_gap, self.last_gap), peak_gap)
+            min_load = torch.where(active, torch.minimum(min_load, self.normal_fraction), min_load)
+            no_contact |= active & (load < 1e-6)
+            peak_drop = torch.where(
+                active, torch.maximum(peak_drop, -self.position[:, 2]), peak_drop
+            )
+            event_velocity = torch.where(active[:, None], self.velocity, event_velocity)
+            event_speed = torch.where(
+                active, torch.maximum(event_speed, self.velocity.norm(dim=1)), event_speed
+            )
+            event_spin = torch.where(
+                active, torch.maximum(event_spin, self.omega.norm(dim=1)), event_spin
+            )
+            event_error = torch.where(active, error, event_error)
+            event_started |= active & started
+            event_success |= first & success & ~failure
+            event_failure |= first & failure
+            event_time = torch.where(
+                first, self.steps.float() * self.dt + (substep + 1) * h, event_time
+            )
+        self.last_diagnostics = dict(
+            mode_error=peak_error,
+            contact_gap=peak_gap,
+            min_normal_load=min_load,
+            no_contact=no_contact,
+            tray_drop=peak_drop,
+            terminal_vertical_velocity=event_velocity[:, 2],
+            max_tray_speed=event_speed,
+            max_tray_angular_speed=event_spin,
+        )
+        return event_success, event_failure, event_started, event_error, event_time
 
     def outcomes(self):
         c, rot, vr, wr, _, _ = self.state()
@@ -268,21 +341,21 @@ class TrayEnv:
         if task == "sticking":
             error = delta[:, :2].norm(dim=-1) / 0.003 + angle / 0.05236
             mode_fail = (delta[:, :2].norm(dim=-1) > pos_tol) | (angle > angle_tol)
-            target = c.new_tensor([0.5, 0.0, 0.0])
+            target = c.new_tensor([self.cfg.goal, 0.0, 0.0])
             success = (self.position - target).norm(dim=-1) < 0.005
             success &= (self.velocity.norm(dim=-1) < 0.03) & (self.omega.norm(dim=-1) < 0.1)
             started = torch.ones_like(success)
         elif task == "sliding":
             error = delta[:, 1].abs() / 0.003 + angle / 0.05236
             mode_fail = (delta[:, 1].abs() > pos_tol) | (angle > angle_tol) | (vr[:, 0] < -0.03)
-            success = delta[:, 0] >= 0.2
+            success = delta[:, 0] >= self.cfg.goal
             started = vr[:, 0] > 0.02
         elif task == "twisting":
             error = delta[:, :2].norm(dim=-1) / 0.003 + tilt / 0.05236
             mode_fail = (
                 (delta[:, :2].norm(dim=-1) > pos_tol) | (tilt > angle_tol) | (wr[:, 2] < -0.1)
             )
-            success = yaw >= torch.pi / 2
+            success = yaw >= self.cfg.goal
             started = wr[:, 2] > 0.1
         else:
             local = self.zeros(3)
@@ -298,40 +371,51 @@ class TrayEnv:
             axis_error = torch.acos(rot[:, 1, 1].clamp(-1, 1))
             error = slip / 0.003 + axis_error / 0.05236
             mode_fail = (slip > pos_tol) | (axis_error > angle_tol) | (wr[:, 1] < -0.1)
-            local[:, 2] *= -1
-            next_edge = c + mv(rot, local)
-            success = (pitch > torch.pi / 2 - 0.05236) & (next_edge[:, 2].abs() < 0.002)
+            success = pitch >= self.cfg.goal
             started = wr[:, 1] > 0.1
-        separation = self.contact_gap(c, rot) > 0.008
+        self.last_gap = self.contact_gap(c, rot)
+        separation = self.last_gap > self.cfg.gap_tolerance
+        unloaded = self.normal_fraction < self.cfg.min_normal_load
         limits = (self.velocity.norm(dim=-1) > self.cfg.tray_speed_limit) | (
             self.omega.norm(dim=-1) > self.cfg.tray_angular_speed_limit
         )
-        outside = (c[:, :2].abs() > 0.4).any(1)
-        failed = mode_fail | separation | limits | outside
+        corners = self.bottom_corners(c, rot)
+        # For tipping only the fixed +x edge must remain on the tray; the lifted
+        # face may overhang. Full face contact uses all four projected vertices.
+        support = corners[:, 2:] if task == "tipping" else corners
+        outside = (support[:, :, :2].abs() > 0.4).any(dim=(1, 2))
+        failed = mode_fail | separation | unloaded | limits | outside
         return success & ~failed, failed, started, error
 
-    def contact_gap(self, c, rot):
-        """Minimum original bottom-corner height; diagnostic, not a force test."""
+    def bottom_corners(self, c, rot):
         corners = c.new_tensor([[-1, -1, -1], [-1, 1, -1], [1, -1, -1], [1, 1, -1]])
-        bottom = c[:, None] + torch.einsum(
+        return c[:, None] + torch.einsum(
             "nij,nkj->nki", rot, corners[None] * self.size[:, None] / 2
         )
-        return bottom[:, :, 2].amin(1)
+
+    def contact_gap(self, c, rot):
+        """Minimum bottom-corner gap; paired with load and mode-error checks."""
+        return self.bottom_corners(c, rot)[:, :, 2].amin(1)
 
     def potential(self):
         """Shared goal shaping; terminal potential is zero in every group."""
         if self.cfg.task == "sticking":
-            goal = self.position.new_tensor([0.5, 0.0, 0.0])
-            return -(self.position - goal).norm(dim=-1) / 0.5 - 0.1 * self.velocity.norm(dim=-1)
+            goal = self.position.new_tensor([self.cfg.goal, 0.0, 0.0])
+            return -(self.position - goal).norm(dim=-1) / self.cfg.goal - 0.1 * self.velocity.norm(
+                dim=-1
+            )
         if self.cfg.task == "sliding":
-            return -(self.sim.data.qpos[:, 0] - self.origin[:, 0] - 0.2).abs() / 0.2
+            return (
+                -(self.sim.data.qpos[:, 0] - self.origin[:, 0] - self.cfg.goal).abs()
+                / self.cfg.goal
+            )
         rot = rotation(self.sim.data.qpos[:, 3:7])
         angle = (
             torch.atan2(rot[:, 0, 2], rot[:, 0, 0])
             if self.cfg.task == "tipping"
             else torch.atan2(rot[:, 1, 0], rot[:, 0, 0])
         )
-        return -(angle - torch.pi / 2).abs() / (torch.pi / 2)
+        return -(angle - self.cfg.goal).abs() / self.cfg.goal
 
     @torch.no_grad()
     def step(self, action, invalid=None):
@@ -348,6 +432,8 @@ class TrayEnv:
                 action
                 + self.cfg.disturbance
                 * torch.randn(action.shape, device=self.device, generator=self.noise_rng)
+                * action.new_tensor(METRIC_SCALE)
+                / self.scale
             ).clamp(-1, 1)
         margin, distance = self.zeros(), self.zeros()
         before_entry = ~self.entered
@@ -355,7 +441,11 @@ class TrayEnv:
             startup = before_entry if self.cfg.group == "E" else torch.zeros_like(before_entry)
             inequalities, equalities = self.constraints(startup)
             margin, distance = measures(
-                inequalities, equalities, applied, self.cfg.projection_iterations
+                inequalities,
+                equalities,
+                applied,
+                self.cfg.projection_iterations,
+                action_scale=self.scale,
             )
         events = self.physics(applied * self.scale)
         self.steps += 1
@@ -368,7 +458,7 @@ class TrayEnv:
         physical_failure = failure & ~invalid
         failure |= invalid
         self.entered |= started
-        timeout = self.steps >= 250
+        timeout = self.steps >= self.max_steps
         done = success | failure | timeout
         reward = self.zeros() - self.dt
         reward += 10 * success.float() - 10 * ((failure | timeout) & ~success).float()
@@ -394,8 +484,8 @@ class TrayEnv:
             distance=distance,
             mapping_failure=invalid.clone(),
             physical_failure=physical_failure,
-            mode_error=error.clone(),
-            contact_gap=self.contact_gap(*self.state()[:2]),
+            timeout=timeout & ~success & ~failure,
+            **self.last_diagnostics,
         )
         # Return terminal outcomes while resetting completed worlds for the next action.
         ids = done.nonzero().flatten()

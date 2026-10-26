@@ -11,6 +11,7 @@ from torch import nn
 
 from .env import EnvConfig, TrayEnv
 from .mapping import GaugeMap, normalized_constraints, violation
+from .settings import BENCHMARK_VERSION, SETTINGS
 
 
 class Policy(nn.Module):
@@ -44,7 +45,9 @@ class Student(nn.Module):
 
 def execute_action(policy, env, raw):
     if policy.kind == "teacher":
-        return GaugeMap(*env.constraints(), iterations=env.cfg.mapping_iterations)(raw)
+        return GaugeMap(
+            *env.constraints(), iterations=env.cfg.mapping_iterations, action_scale=env.scale
+        )(raw)
     action = raw if policy.kind == "student" else raw.tanh()
     return action, torch.zeros_like(env.entered)
 
@@ -70,20 +73,24 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
     )
     successes, times, failures, mapping_failures = [], [], [], []
     mode_errors, contact_gaps = [], []
+    frictions, drops, vertical_speeds, timeouts, load_minima, no_contacts = [], [], [], [], [], []
     violations, transitions = torch.zeros((), device=device), torch.zeros((), device=device)
     with torch.inference_mode():
         for batch in range((episodes + env.n - 1) // env.n):
             env.rng.manual_seed(10000 + batch)
             env.noise_rng.manual_seed(20000 + batch)
             env.reset(env.all_ids)
+            frictions.append(env.mu.cpu().clone())
             obs = env.observe()
             alive = torch.arange(env.n, device=device) < min(env.n, episodes - batch * env.n)
             success, duration, failure, mapping_failure = [env.zeros() for _ in range(4)]
             max_error, max_gap = env.zeros(), env.zeros()
-            for _ in range(250):
+            max_drop, final_vz, timed_out = env.zeros(), env.zeros(), env.zeros()
+            min_load, lost_contact = torch.ones_like(max_drop), torch.zeros_like(alive)
+            for _ in range(env.max_steps):
                 mean, _ = policy(obs)
                 action, invalid = execute_action(policy, env, mean)
-                constraints = normalized_constraints(*env.constraints())
+                constraints = normalized_constraints(*env.constraints(), action_scale=env.scale)
                 violated = violation(*constraints, action) > 1e-4
                 violations += ((violated | invalid) & alive).sum()
                 transitions += alive.sum()
@@ -92,18 +99,32 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
                     alive, torch.maximum(max_error, info["mode_error"]), max_error
                 )
                 max_gap = torch.where(alive, torch.maximum(max_gap, info["contact_gap"]), max_gap)
+                max_drop = torch.where(alive, torch.maximum(max_drop, info["tray_drop"]), max_drop)
+                min_load = torch.where(
+                    alive, torch.minimum(min_load, info["min_normal_load"]), min_load
+                )
+                lost_contact |= alive & info["no_contact"]
                 first = alive & done
                 success[first] = info["success"][first].float()
                 duration[first] = info["time"][first]
                 failure[first] = info["physical_failure"][first].float()
                 mapping_failure[first] = info["mapping_failure"][first].float()
+                final_vz[first] = info["terminal_vertical_velocity"][first]
+                timed_out[first] = info["timeout"][first].float()
                 alive &= ~done
+                if not alive.any():
+                    break
             successes.append(success.cpu())
             times.append(duration.cpu())
             failures.append(failure.cpu())
             mapping_failures.append(mapping_failure.cpu())
             mode_errors.append(max_error.cpu())
             contact_gaps.append(max_gap.cpu())
+            drops.append(max_drop.cpu())
+            vertical_speeds.append(final_vz.cpu())
+            timeouts.append(timed_out.cpu())
+            load_minima.append(min_load.cpu())
+            no_contacts.append(lost_contact.cpu())
     success = torch.cat(successes)[:episodes].float()
     duration = torch.cat(times)[:episodes]
     fail = torch.cat(failures)[:episodes].float()
@@ -112,14 +133,31 @@ def evaluate(policy, cfg, bank, episodes, device, noise=0.0):
         episodes=episodes,
         success_rate=success.mean().item(),
         success_time=(duration * success).sum().item() / successful if successful else None,
-        penalized_time=(duration * success + 5 * (1 - success)).mean().item(),
+        penalized_time=(duration * success + cfg.timeout_s * (1 - success)).mean().item(),
         physical_failure_rate=fail.mean().item(),
         mapping_failure_rate=torch.cat(mapping_failures)[:episodes].mean().item(),
         constraint_violation_rate=(violations / transitions.clamp_min(1)).item(),
         mean_episode_max_mode_error=torch.cat(mode_errors)[:episodes].mean().item(),
         mean_episode_max_contact_gap=torch.cat(contact_gaps)[:episodes].mean().item(),
+        timeout_rate=torch.cat(timeouts)[:episodes].mean().item(),
+        mean_episode_max_drop=torch.cat(drops)[:episodes].mean().item(),
+        mean_abs_terminal_vertical_speed=torch.cat(vertical_speeds)[:episodes].abs().mean().item(),
+        mean_episode_min_normal_load=torch.cat(load_minima)[:episodes].mean().item(),
+        any_substep_without_contact_rate=torch.cat(no_contacts)[:episodes].float().mean().item(),
         disturbance=noise,
     )
+    mu = torch.cat(frictions)[:episodes]
+    edges = torch.linspace(*SETTINGS[cfg.task].friction, 6)
+    bins = torch.bucketize(mu, edges[1:-1], right=True)
+    result["friction_bins"] = [
+        dict(
+            low=edges[i].item(),
+            high=edges[i + 1].item(),
+            episodes=int((bins == i).sum()),
+            success_rate=success[bins == i].mean().item() if (bins == i).any() else None,
+        )
+        for i in range(5)
+    ]
     return result
 
 
@@ -224,6 +262,8 @@ def train(config, train_bank, validation_bank, output, device="cuda:0"):
 def test(checkpoint, bank, output, episodes=8192, device="cuda:0"):
     torch.set_num_threads(4)
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload["config"]["env"].get("benchmark_version") != BENCHMARK_VERSION:
+        raise ValueError("Old benchmark checkpoint; retrain using four-mode-v2 settings.")
     if payload["observations"] != 36:
         raise ValueError("This version uses 36 observations; retrain older 46-input checkpoints.")
     kind = payload.get("kind", "direct")

@@ -9,8 +9,9 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial import ConvexHull
+from scipy.spatial.transform import Rotation
 
-TASKS = ("sticking", "sliding", "tipping", "twisting")
+from .settings import BENCHMARK_VERSION, SETTINGS, TASKS
 
 
 def generators(size, mu, task):
@@ -51,28 +52,72 @@ def double_description(v):
     return normals, equality
 
 
+def settled_pose(size, mu, tilt, offset, task):
+    """Static initialization only; no reference trajectory enters policy training.
+
+    Use the same contact model as the batched environment, and set mass/inertia
+    before settling. Settling offline avoids advancing unrelated live episodes.
+    """
+    import mujoco
+    from .model import XML
+
+    model = mujoco.MjModel.from_xml_string(XML)
+    model.opt.timestep = 0.0005
+    model.opt.iterations, model.opt.ls_iterations = 30, 10
+    model.geom_size[1] = size / 2
+    model.geom_friction[1, 0] = mu
+    model.body_mass[1] = 1.0
+    model.body_inertia[1] = (np.sum(size**2) - size**2) / 12
+    data = mujoco.MjData(model)
+    mujoco.mj_setConst(model, data)
+    data.qpos[:3] = [offset[0], offset[1], size[2] / 2]
+    if task in ("sliding", "tipping"):
+        data.qpos[0] -= 0.1
+    data.qpos[3:7] = [1, 0, 0, 0]
+    tray_rotation = Rotation.from_euler("xy", tilt, degrees=True)
+    gravity = tray_rotation.inv().apply([0, 0, -9.81])
+    for _ in range(160):
+        data.qfrc_applied[:3] = gravity
+        mujoco.mj_step(model, data)
+    xyzw = tray_rotation.as_quat()
+    return data.qpos.copy(), np.r_[xyzw[3], xyzw[:3]]
+
+
 def _one(args):
-    size, mu = args
-    return [double_description(generators(size, mu, task)) for task in TASKS]
+    size, mu, tilt, offset, task = args
+    h, e = double_description(generators(size, mu, task))
+    qpos, quaternion = settled_pose(size, mu, tilt, offset, task)
+    return h, e, qpos, quaternion
 
 
 def build(path, count=8192, seed=101, workers=8):
     rng = np.random.default_rng(seed)
-    sizes = rng.uniform([0.06, 0.06, 0.05], [0.30, 0.30, 0.40], size=(count, 3))
-    friction = rng.uniform(0.1, 0.8, count)
+    arrays = dict(benchmark_version=np.array(BENCHMARK_VERSION))
     with ProcessPoolExecutor(workers) as pool:
-        results = list(pool.map(_one, zip(sizes, friction), chunksize=16))
-    arrays = dict(size=sizes.astype("float32"), mu=friction.astype("float32"))
-    for k, task in enumerate(TASKS):
-        nh = max(len(r[k][0]) for r in results)
-        ne = len(results[0][k][1])
-        h = np.zeros((count, nh, 6), dtype="float32")
-        e = np.zeros((count, ne, 6), dtype="float32")
-        for i, result in enumerate(results):
-            hi, ei = result[k]
-            h[i, : len(hi)] = hi
-            e[i] = ei
-        arrays[f"{task}_h"] = h
-        arrays[f"{task}_e"] = e
+        for task in TASKS:
+            spec = SETTINGS[task]
+            sizes = rng.uniform(spec.size_low, spec.size_high, size=(count, 3))
+            friction = rng.uniform(*spec.friction, count)
+            tilt = rng.uniform(-spec.initial_tilt_deg, spec.initial_tilt_deg, (count, 2))
+            offset = rng.uniform(-spec.initial_xy_offset, spec.initial_xy_offset, (count, 2))
+            results = list(
+                pool.map(_one, zip(sizes, friction, tilt, offset, [task] * count), chunksize=16)
+            )
+            nh = max(len(r[0]) for r in results)
+            ne = len(results[0][1])
+            h = np.zeros((count, nh, 6), dtype="float32")
+            e = np.zeros((count, ne, 6), dtype="float32")
+            for i, (hi, ei, _, _) in enumerate(results):
+                h[i, : len(hi)] = hi
+                e[i] = ei
+            for name, value in dict(
+                size=sizes,
+                mu=friction,
+                h=h,
+                e=e,
+                qpos=[r[2] for r in results],
+                quaternion=[r[3] for r in results],
+            ).items():
+                arrays[f"{task}_{name}"] = np.asarray(value, dtype="float32")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)

@@ -54,17 +54,17 @@ def grid(task, group):
     ]
 
 
-def configuration(task, group, num_envs, iterations, **weights):
+def configuration(task, group, num_envs, iterations, seed=1, **weights):
     return dict(
-        env=asdict(EnvConfig(task=task, group=group, num_envs=num_envs, seed=1, **weights)),
+        env=asdict(EnvConfig(task=task, group=group, num_envs=num_envs, seed=seed, **weights)),
         ppo=dict(
             iterations=iterations,
-            rollout_steps=32,
+            rollout_steps=128,
             epochs=4,
             minibatches=16,
             learning_rate=3e-4,
-            gamma=0.99,
-            gae_lambda=0.95,
+            gamma=0.99**0.25,
+            gae_lambda=0.95**0.25,
             entropy=0.005,
             compile=True,
             log_interval=10,
@@ -82,14 +82,17 @@ def run(
     bank_size=8192,
     workers=8,
     groups=("A", "B", "C", "D", "E", "F"),
+    seed=1,
 ):
     if not gpus or not groups or any(g not in "ABCDEF" or len(g) != 1 for g in groups):
         raise ValueError("Specify GPUs and groups from A, B, C, D, E, F.")
     root = Path(root).resolve()
+    if any((root / name).exists() for name in ("banks", "search", "best", "results.csv")):
+        raise FileExistsError("Experiment output already exists; choose a fresh --root.")
     root.mkdir(parents=True, exist_ok=True)
     banks = root / "banks"
-    for split, seed in (("train", 101), ("validation", 202), ("test", 303)):
-        build(banks / f"{split}.npz", bank_size, seed, workers)
+    for split, bank_seed in (("train", 101), ("validation", 202), ("test", 303)):
+        build(banks / f"{split}.npz", bank_size, bank_seed, workers)
     jobs = []
     for task in TASKS:
         for group in dict.fromkeys(groups):
@@ -98,7 +101,9 @@ def run(
             for index, weights in enumerate(grid(task, group)):
                 directory = root / "search" / task / group / f"{index:03d}"
                 directory.mkdir(parents=True, exist_ok=True)
-                config = configuration(task, group, num_envs, search_iterations, **weights)
+                config = configuration(
+                    task, group, num_envs, search_iterations, seed=seed, **weights
+                )
                 (directory / "config.json").write_text(json.dumps(config, indent=2))
                 jobs.append(directory)
     slots = Queue()
@@ -160,7 +165,7 @@ def run(
 
                 destination = root / "best" / task / group
                 destination.mkdir(parents=True, exist_ok=True)
-                cfg = configuration(task, group, num_envs, final_iterations)
+                cfg = configuration(task, group, num_envs, final_iterations, seed=seed)
                 cfg["ppo"]["validation_episodes"] = 4096
                 cfg["distill"] = asdict(DistillConfig())
                 (destination / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -212,6 +217,12 @@ def run(
                 "mean_episode_max_mode_error",
                 "mean_episode_max_contact_gap",
                 "disturbance",
+                "timeout_rate",
+                "mean_episode_max_drop",
+                "mean_abs_terminal_vertical_speed",
+                "mean_episode_min_normal_load",
+                "any_substep_without_contact_rate",
+                "friction_bins",
             ],
         )
         writer.writeheader()
@@ -221,6 +232,8 @@ def run(
                 stages.append(("teacher", "teacher_test.json"))
             for stage, file in stages:
                 for metrics in json.loads((directory / file).read_text()):
+                    if "friction_bins" in metrics:
+                        metrics["friction_bins"] = json.dumps(metrics["friction_bins"])
                     writer.writerow(
                         dict(
                             task=directory.parent.name, group=directory.name, stage=stage, **metrics

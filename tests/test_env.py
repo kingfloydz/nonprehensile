@@ -17,12 +17,12 @@ def test_accelerating_frame_preserves_free_fall(tmp_path):
     rot = rotation(env.quaternion)
     c, _, _, wr, _, _ = env.state()
     world_com = env.position + mv(rot, c)
-    expected = torch.tensor([[0.0, 0.0, 1.0 - 0.5 * 9.81 * 0.02**2]]).expand(2, 3)
+    expected = torch.tensor([[0.0, 0.0, 1.0 - 0.5 * 9.81 * env.dt**2]]).expand(2, 3)
     torch.testing.assert_close(world_com, expected, atol=3e-4, rtol=0)
     torch.testing.assert_close(mv(rot, env.omega + wr), torch.zeros(2, 3), atol=1e-3, rtol=0)
 
 
-def test_all_reward_modes_step_with_randomized_masses(tmp_path):
+def test_all_reward_modes_step_with_fixed_mass_and_randomized_inertia(tmp_path):
     torch.set_num_threads(2)
     bank = tmp_path / "bank.npz"
     build(bank, count=4, workers=1)
@@ -34,6 +34,8 @@ def test_all_reward_modes_step_with_randomized_masses(tmp_path):
         assert not done.any()
         assert torch.isfinite(info["distance"]).all()
         torch.testing.assert_close(env.sim.model.body_mass[:, 1], env.mass)
+        torch.testing.assert_close(env.mass, torch.ones(2))
+        assert (info["min_normal_load"] > 0.1).all()
 
 
 def test_observations_and_mapping_failure(tmp_path):

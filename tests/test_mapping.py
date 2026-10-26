@@ -57,6 +57,18 @@ def test_mapping_rejects_empty_rank_change_and_collapsed_sets():
     assert not mapping.valid.any()
 
 
+def test_teacher_respects_task_acceleration_scale():
+    # ax <= -1 m/s², with a narrow +/-2 m/s² action range.
+    scale = (2.0, 2.0, 30.0, 2.0, 2.0, 2.0)
+    h = torch.tensor([[[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]]])
+    e = torch.zeros(1, 0, 7)
+    mapping = GaugeMap(h, e, action_scale=scale)
+    action, invalid = mapping(torch.zeros(1, 6))
+    assert not invalid.any()
+    physical = action * torch.tensor(scale)
+    assert -2 < physical[0, 3] < -1
+
+
 @pytest.mark.parametrize("task", TASKS)
 def test_mode_mapping_matches_independent_phase_one(task):
     rng = np.random.default_rng(19)

@@ -96,7 +96,7 @@ def test_selection_uses_validation_and_keeps_one_seed(tmp_path, monkeypatch, gl_
                     )
                 ),
             )
-            assert config["env"] == expected
+            assert config["env"] == json.loads(json.dumps(expected))
             selection = json.loads(path.with_name("selection.json").read_text())
             assert selection["tied_candidates"] >= 1
     assert (tmp_path / "results.csv").exists()
@@ -115,6 +115,14 @@ def test_reduced_grid_keeps_task_specific_candidates():
         for m in (0.01, 0.1)
         for s in (1.0, 3.0)
     ]
+
+
+def test_existing_runs_are_never_overwritten(tmp_path):
+    result = tmp_path / "results.csv"
+    result.write_text("existing results")
+    with pytest.raises(FileExistsError, match="fresh"):
+        pipeline.run(tmp_path, [0])
+    assert result.read_text() == "existing results"
 
 
 def test_headless_default_before_mujoco_import():

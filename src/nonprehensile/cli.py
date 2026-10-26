@@ -18,13 +18,16 @@ def main(argv=None):
     bank.add_argument("--seed", type=int, default=101)
     bank.add_argument("--workers", type=int, default=8)
     pipeline = sub.add_parser("pipeline")
-    pipeline.add_argument("--root", default="runs/experiment")
+    pipeline.add_argument("--root", default="runs/four-mode-v2")
     pipeline.add_argument("--gpus", type=int, nargs="+", default=[0])
     pipeline.add_argument("--num-envs", type=int, default=4096)
     pipeline.add_argument("--search-iterations", type=int, default=300)
     pipeline.add_argument("--final-iterations", type=int, default=2000)
     pipeline.add_argument("--bank-size", type=int, default=8192)
     pipeline.add_argument("--workers", type=int, default=8)
+    pipeline.add_argument(
+        "--seed", type=int, default=1, help="Training seed; use separate roots for seeds 1, 2, 3"
+    )
     pipeline.add_argument("--groups", nargs="+", choices=list("ABCDEF"), default=list("ABCDEF"))
     train = sub.add_parser("train")
     train.add_argument("--config", required=True)

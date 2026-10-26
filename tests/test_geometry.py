@@ -125,3 +125,18 @@ def test_expanded_action_box_uses_original_margin_units():
     margin, distance = measures(empty, empty, torch.tensor([[0.75, 0, 0, 0, 0, 0.0]]))
     torch.testing.assert_close(margin, torch.tensor([0.5]))
     torch.testing.assert_close(distance, torch.tensor([0.0]))
+
+
+def test_physical_distance_does_not_change_with_policy_scaling():
+    # Same physical point, same halfspace and fixed metric, different action boxes.
+    h = torch.tensor([[[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]])
+    e = torch.zeros(1, 0, 7)
+    physical = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
+    results = []
+    for scale in ((2.0, 2.0, 2.0, 2.0, 1.0, 1.0), (2.0, 2.0, 30.0, 5.0, 2.0, 2.0)):
+        results.append(
+            measures(h, e, physical / torch.tensor(scale), iterations=256, action_scale=scale)
+        )
+    for margin, distance in results:
+        torch.testing.assert_close(margin, torch.tensor([-1 / 15]), atol=1e-5, rtol=0)
+        torch.testing.assert_close(distance, torch.tensor([1 / 15]), atol=1e-5, rtol=0)

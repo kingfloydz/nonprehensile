@@ -5,6 +5,7 @@ import torch
 from nonprehensile import ppo
 from nonprehensile.bank import build
 from nonprehensile.pipeline import configuration
+from nonprehensile.env import EnvConfig
 
 
 def test_teacher_ppo_distillation_and_deployment(tmp_path, monkeypatch):
@@ -66,3 +67,20 @@ def test_student_action_does_not_query_geometry():
     action, invalid = ppo.execute_action(student, Environment(), raw)
     torch.testing.assert_close(action, raw)
     assert not invalid.any()
+
+
+def test_actual_evaluation_reports_paired_friction_bins_and_timeout(tmp_path):
+    bank = tmp_path / "bank.npz"
+    build(bank, count=4, workers=1)
+    student = ppo.Student(36)
+    with torch.no_grad():
+        for parameter in student.parameters():
+            parameter.zero_()
+    cfg = EnvConfig(task="twisting", num_envs=2, timeout_s=0.02)
+    first = ppo.evaluate(student, cfg, bank, 2, "cpu")
+    second = ppo.evaluate(student, cfg, bank, 2, "cpu")
+    assert first == second
+    assert first["success_rate"] == 0 and first["timeout_rate"] == 1
+    assert sum(item["episodes"] for item in first["friction_bins"]) == 2
+    assert first["mean_abs_terminal_vertical_speed"] == 0
+    assert first["mean_episode_min_normal_load"] > 0.1

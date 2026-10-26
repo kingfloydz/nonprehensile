@@ -1,348 +1,188 @@
 # Nonprehensile tray RL
 
-Four independent tasks, five reward ablations (A–E), and a constrained-teacher /
-distilled-student method (F), with one training seed (`1`). Built on the official
-**mjlab 1.6.0 / MuJoCo-Warp** simulation API and the official RSL-RL `MLP`,
-with batched PyTorch PPO.
-Each task/group trains a separate policy.
-The server pipeline prepares geometry, searches weights, selects on held-out
-validation, retrains each selected setting, and exports held-out test results.
-There are no automatic retries, CPU fallbacks, or environment-detection scripts.
+Four independent tasks compare A–E reward ablations and a constrained teacher /
+distilled student F. Every method observes the same state and commands **all six
+tray acceleration components**. Built on mjlab 1.6.0 / MuJoCo-Warp and PyTorch PPO
+with the official RSL-RL MLP. This is a tray-object benchmark, not a G1 hardware model.
 
-## H200
+## Run
 
-Use Linux, Python 3.12, an NVIDIA driver compatible with the CUDA build of PyTorch,
-and GPU-enabled mjlab 1.6.0. In that environment:
+Use Linux, Python 3.12, GPU-enabled mjlab and a compatible NVIDIA driver:
 
 ```bash
 git clone https://github.com/kingfloydz/nonprehensile.git
 cd nonprehensile
 python3 -m pip install -e .
-python3 src/nonprehensile/pipeline.py --gpus 0 --num-envs 4096 --root runs/main
+python3 src/nonprehensile/pipeline.py --gpus 0 --num-envs 4096 --root runs/four-mode-v2-seed1 --seed 1
 ```
 
-Several GPUs run independent experiments concurrently (one process per GPU):
+Repeat with seeds 2 and 3 and distinct output roots. Bank seeds stay 101/202/303
+for train/validation/test: all methods and training seeds share physical samples.
+Multiple GPUs schedule independent runs (`--gpus 0 1 2 3`). `--groups A F` runs
+just those methods. Subprocesses use the same interpreter and inherit MUJOCO_GL.
 
-```bash
-python3 src/nonprehensile/pipeline.py --gpus 0 1 2 3 --num-envs 8192 --root runs/h200 \
-  --search-iterations 300 --final-iterations 2000 --bank-size 8192 --workers 16
-```
+Each seed runs 26 weight-search candidates and 23 final runs. Sticking E equals D
+and is omitted. Validation selects weights by success rate, then penalized time,
+never shaped return. F trains its own teacher then BC/DAgger; no baseline policy
+initializes it. Test data never select settings. Old runs are not modified.
 
-An absolute script path also works from any working directory. Relative output
-paths are resolved against the working directory. Training and test subprocesses
-use the same Python interpreter as the pipeline (`sys.executable`). With the
-dependencies already installed in system Python, editable installation is optional.
+**Rebuild banks and retrain old checkpoints.** The `four-mode-v2` version tag
+rejects legacy banks/checkpoints, including 36-input policies with old action
+semantics. Use a fresh output root.
 
-The full pipeline performs **26 search runs + 23 final runs**. Sticking E is omitted
-because it has no startup transition and would duplicate D. Each PPO iteration
-contains `32 * num_envs` transitions. Weight selection uses highest validation
-success rate, then lowest failure-penalized time; never shaped training return.
-F has no physics-reward weights to search: each of its four final runs trains a
-teacher for the final PPO budget, then distills a student. To run F only:
+## Shared experimental settings
 
-```bash
-python3 src/nonprehensile/pipeline.py --groups F --gpus 0 --num-envs 4096 --root runs/f
-```
+`src/nonprehensile/settings.py` defines all four domains. Dimensions are full box
+lengths; ranges are independent uniforms. Mass is **1 kg**; uniform-box inertia
+is recomputed from each sampled size. Tray: 80 x 80 cm. Static and kinetic
+friction share the sampled coefficient.
 
-Use `--groups A F` for the task-only baseline versus F, or `--groups A B C D E`
-to retain only the original ablations.
-The default search/final budgets are intentionally configurable. "Best" means
-best on validation among the searched candidates, not globally optimal weights.
-`selection.json` records whether any task was solved and how many candidates tied.
-A zero-success selection is a diagnostic default, not evidence of optimal weights.
-Tasks and goals are fixed from the start: there is no curriculum or extra scene.
-Use a fresh output root for this revision; old action scales and results are not
-directly comparable, and old policies must be retrained.
-
-Outputs:
-
-```
-runs/main/
-  banks/{train,validation,test}.npz
-  search/<task>/<group>/<trial>/{config.json,policy.pt,validation.json,learning.jsonl}
-  best/<task>/<group>/{config.json,policy.pt,validation.json,test.json,selected_from.txt}
-  best/<task>/F/{teacher.pt,teacher_validation.json,teacher_test.json}
-  best/<task>/F/{policy.pt,student_actor.pt,distillation.jsonl,distill_config.json}
-  results.csv
-```
-
-`best` contains each group's final model. F's `policy.pt` is the student;
-`teacher.pt` retains the constrained policy. F does not have `selected_from.txt`.
-`results.csv` distinguishes `direct`, `teacher`, and `student` stages. Search
-logs/checkpoints remain available for auditing. Validation and test use fixed
-first-episode batches, so faster failures do not get overrepresented. Test results
-include normalized acceleration noise standard deviations 0, .01, .03, .05.
-`constraint_violation_rate` measures nominal commanded actions before disturbance
-and before terminal/reset transitions, using normalized halfspaces/equalities
-with tolerance 1e-4. `mapping_failure_rate` is the fraction of episodes terminated
-by an unverified teacher mapping; it is separate from physical failures.
-`mean_episode_max_mode_error` reports the mean per-episode maximum normalized
-unwanted-motion error (the original 3 mm / 3 degree reward units).
-`mean_episode_max_contact_gap` reports mean per-episode maximum positive original
-bottom-corner height in meters, sampled at control boundaries before reset. It is
-a separation diagnostic, not a contact-force certificate or a substep flight test.
-
-## Experiment
-
-| Setting | Value |
-|---|---|
-| Tray | 0.80 x 0.80 m |
-| Box length / width | independent U(0.06, 0.30) m |
-| Box height | U(0.05, 0.40) m |
-| Static = kinetic friction | U(0.10, 0.80) |
-| Density | 500 kg/m^3; mass and inertia change with dimensions |
-| Action | six tray accelerations, each angular component +/-60 rad/s^2, linear +/-30 m/s^2 |
-| Tray speed | <=5 m/s, angular speed <=10 rad/s; exceeding a limit terminates the episode |
-| Control / physics | 20 ms / 1 ms |
-| Timeout | 5 s |
-| Relative acceleration | beta >= -v_parallel/(2 dt), using the 20 ms control period |
-
-Each split contains independent uniform samples of dimensions and friction.
-An episode samples a row from its split's **finite randomized bank**, rather than
-drawing a fresh continuous parameter and running CPU double description on reset.
-Increase `--bank-size` for wider empirical coverage. Banks are disjoint by RNG seed
-(101/202/303); training policy seed is always 1. No unseen test data select weights.
-
-| Task | Success | Forbidden motion |
-|---|---|---|
-| sticking | tray moves +0.5 m along world x and stops | box translation/rotation relative to tray |
-| sliding | box first reaches +0.2 m along tray x | transverse sliding, relative rotation |
-| tipping | box rotates about its +x bottom edge until the next face first touches | edge translation, rotation away from its y-axis |
-| twisting | box first reaches +90 degrees about its normal COM axis | COM translation, tilt |
-
-All start at relative rest. Sliding starts at x=-0.1 m and ends at x=+0.1 m;
-tipping also starts at x=-0.1 m to leave room in its falling direction.
-The selected task fixes direction; policies are trained independently per task.
-Sliding/twisting end at first passage, **not at rest**. The directional bound allows
-braking while predicting at least half the current signed speed at the next control
-step; it does not guarantee the independent simulator follows that prediction.
-At rest the bound is beta >= 0, so it does not force startup. Tipping ends at first
-new-face contact; post-impact settling is not scored. Tipping checks outcomes every
-1 ms and latches the first success or failure, with failure winning simultaneous
-events. Event time and error are retained even if impact causes a later rebound.
-The vectorized simulation finishes the control step before terminal worlds reset.
-All tasks reject separation, tray-speed violations, and leaving the tray.
-Motion failure tolerances are 10 mm and 10 degrees; the sticking endpoint tolerance is 5 mm
-with speeds below .03 m/s and .10 rad/s.
-The separation threshold remains 8 mm; small positive gaps can still pass it and
-are reported separately. Reverse-motion thresholds remain -.03 m/s / -.10 rad/s.
-Speed limits are terminal checks, not additional rows in the contact polyhedron;
-the teacher does not certify trajectory-level speed safety. `EnvConfig` exposes
-the translation/rotation tolerances and tray linear/angular speed limits.
-
-## Rewards
-
-All groups share `-dt + 10*success - 10*failure`; timeout is failure. A common
-potential term `gamma * Phi(next) - Phi(now)` uses negative normalized goal error
-(plus a small speed term for transport), with zero terminal potential. This gives
-all baselines goal-progress feedback without changing the discounted task optimum;
-it is fixed across groups and is not part of the reward-weight search.
-Physics costs are multiplied by dt, preventing dependence on reward sampling rate.
-
-| Group | Additional penalty | Search weights |
-|---|---|---|
-| A | none | one setting |
-| B | normalized unwanted translation/rotation | task-specific fixed weight below |
-| C | distance^2, after entering the moving mode | task-specific fixed weight below |
-| D | C + softplus((.05 - relative_margin)/.05) | reduced task-specific candidates below |
-| E | D + startup-branch cost continuously until physical mode entry | reduced task-specific candidates below |
-| F | none; constrain teacher actions, then distill | no reward-weight search |
-
-The reduced grid uses prior validation results to prioritize sliding and tipping-E.
-Zero-success tasks use fixed diagnostic settings, not claimed optima. All numbers
-are revalidated under the relaxed environment. Tuples below are `(distance, margin)`
-for D and `(distance, margin, startup)` for E; braces denote Cartesian products.
-
-| Task | B | C | D | E | Candidates including A |
-|---|---|---|---|---|---|
-| sticking | .1 | 1 | (1, .1) | omitted | 4 |
-| sliding | 1 | 10 | (10, {.1, 1}) | (10, {.01, 1}, {.3, 3}) | 9 |
-| tipping | .1 | 1 | (1, .1) | (10, {.01, .1}, {1, 3}) | 8 |
-| twisting | .1 | 1 | (1, .1) | (1, .01, .3) | 5 |
-
-The task reward, goal tolerances, observation scales, PPO settings and reward
-normalizations remain fixed. In particular, B's error uses the original 3 mm /
-3 degree scales, independently of the relaxed failure tolerances.
-
-For sticking, C/D apply immediately. E uses the zero-relative-velocity startup
-branch before entry, then the mode-interior branch. Entry is latched from measured
-positive relative speed (> .02 m/s sliding, > .10 rad/s tipping/twisting), not from
-analytic feasibility. These thresholds operationalize the near-rest startup state.
-The directional speed bound always uses measured signed speed, including during
-E's zero-velocity startup approximation; at exact rest beta=0 is included.
-The task's time/success reward must still encourage starting and finishing.
-
-## Shared observation (36 dimensions)
-
-All groups, teacher and student receive the same state information and fixed
-normalization. There are no method-specific inputs or running observation statistics.
-Lengths are in meters and all relative quantities are expressed in the tray frame.
-
-| Indices (zero-based) | Observation | Scaling | Dimensions |
+| Mode | Goal | Length / width / height (cm) | Friction |
 |---|---|---|---|
-| 0:3 | current object COM relative to tray origin | / 0.4 | 3 |
-| 3:12 | object-to-tray rotation matrix, row-major | none | 9 |
-| 12:15 | relative COM velocity | / 2 | 3 |
-| 15:18 | relative angular velocity | / 3 | 3 |
-| 18:21 | tray world linear velocity expressed in tray frame | / 2 | 3 |
-| 21:24 | tray angular velocity | / 3 | 3 |
-| 24:27 | gravity expressed in tray frame | / 9.81 | 3 |
-| 27:30 | box dimensions | parameter ranges to [-1,1] | 3 |
-| 30:31 | friction coefficient | [0.1,0.8] to [-1,1] | 1 |
-| 31:34 | goal error | task-specific, below | 3 |
-| 34:35 | latched physical mode-entry flag | 0 or 1 | 1 |
-| 35:36 | elapsed episode steps | / 250 | 1 |
+| sticking | transport 50 cm along world x and stop | 15–25 / 15–25 / 10–20 | 0.20–0.50 |
+| sliding | slide 20 cm along tray x | 15–25 / 10–20 / 5–8 | 0.15–0.30 |
+| tipping | rotate 80 degrees about the fixed +x bottom edge | 10–12 / 10–15 / 25–30 | 0.60–0.80 |
+| twisting | rotate 45 degrees about the normal axis through COM | 25–30 / 25–30 / 5–8 | 0.05–0.12 |
 
-Transport uses the world target displacement rotated into the tray frame / 0.5.
-Sliding uses `[remaining x displacement / 0.2, 0, 0]`; tipping/twisting use
-`[remaining pitch/yaw / (pi/2), 0, 0]`. Velocity inputs are not clipped. Absolute
-world pose and previous action are omitted; current COM position is retained so
-contact lever arms and tray boundaries remain observable. Geometry, mass (fixed
-density), friction and task goals are equally available to every method. This is
-a full-state method comparison, not a perception or parameter-estimation test.
-Previous **46-input checkpoints require retraining**.
+Sliding/tipping start at x=-10 cm. Sliding initial tray roll/pitch each range over
+±2 degrees. Twisting initial horizontal COM placement relative to the tray origin
+ranges over ±5 mm per axis (not an internal COM offset).
 
-## F: constrained PPO teacher → unconstrained student
+| Mode | Linear speed norm (m/s) | Angular speed norm (rad/s) | Linear acceleration bounds (m/s²) | Angular acceleration bounds (rad/s²) |
+|---|---:|---:|---|---|
+| sticking | 1.5 | 2 | ±(2,1,1) | ±(2,2,2) |
+| sliding | 3 | 2 | ±(5,1,1) | ±(2,2,2) |
+| tipping | 3 | 2 | ±(6,1,1) | ±(2,2,2) |
+| twisting | 1.5 | 8 | ±(2,2,2) | ±(2,2,30) |
 
-For each state, include the action bounds in the normalized acceleration set:
+There is **no separate downward-acceleration experiment or scripted unloading
+controller**. Twisting policies can translate and rotate together. True friction
+remains in the generators; acceleration affects the required wrench.
 
-$$\mathcal P=\{z:Az\le b,\ Ez=e,\ -1\le z\le1\},\qquad
-\chi=\operatorname{diag}(60,60,60,30,30,30)z.$$
+Control / physics periods: **5 ms / 0.25 ms**; timeout: 5 s. The smaller physics
+step avoids contact chatter observed in sliding at 0.5 ms in the training backend.
+PPO uses 128-step rollouts (0.64 s), gamma=0.99**0.25 and
+GAE lambda=0.95**0.25 to preserve physical discount/rollout times. Each iteration
+contains 128 * num_envs transitions, four times the former transition count.
 
-Compute an orthonormal nullspace basis $Q$ of $E$ and a verified relative-interior
-point $z_0$. With $G=AQ$ and $h=b-Az_0>0$ on nonconstant rows, use
+Banks store task-specific geometry, friction, DD constraints and an 80 ms static
+settling pose. Mass/inertia, placement and tilt are set before settling using the
+shared contact XML. Initial velocities are zero. Settling is offline; resetting
+one world does not advance others. Resets sample finite bank rows, not fresh
+continuous parameters. Increase --bank-size for greater empirical coverage.
 
-$$p(u)=\max_i\frac{G_i u}{h_i},\qquad
-z_A=z_0+Q\frac{u}{1+p(u)},\qquad u\sim\mathcal N(\mu_\theta(o),\Sigma_\theta).$$
+## Task completion and contact checks
 
-The bounded polytope makes this a bijection from the latent space to its relative
-interior, provided the declared equalities span its affine hull. The latent
-dimension is **6/4/6/4** for sticking/sliding/tipping/twisting in this contact model.
-PPO stores and scores the **raw Gaussian sample** $u$, not the mapped acceleration.
-The state-only map cancels from the likelihood ratio; no differentiation through
-geometry or change-of-variables term is needed. The entropy bonus is latent
-Gaussian entropy, not entropy in physical acceleration coordinates. Evaluation
-and distillation use the **mapped latent mean**, not a noisy rollout sample.
+All modes latch the first success/failure at physics substeps; failure takes
+precedence. Diagnostics stop at that event even if the batched simulator finishes
+the control step. Position error must remain ≤1 mm and unwanted rotation ≤1°:
 
-The interior point uses a fixed-budget batched phase-I log barrier (default 32
-Newton iterations, at most 7-by-7 systems). It starts deterministically from the
-current state, without a history-dependent warm start. Padded/constant facets are
-masked; every center and action is checked against the inequalities and equalities.
-Rank change, collapsed interior, numerical failure or infeasibility terminates
-the affected episode and increments the mapping-failure metric. Failure to find a
-certificate is **not proof that the polytope is empty**. No action is presented as
-feasible after a failed certificate; the batched simulator uses a zero placeholder
-for that discarded terminal transition. `env.mapping_iterations` controls the
-solver budget. Full float32 matmul precision is used for the equality checks.
+- sticking: relative horizontal COM displacement and relative rotation;
+- sliding: transverse displacement and relative rotation;
+- tipping: displacement of both fixed-edge endpoints and off-axis rotation;
+- twisting: horizontal COM displacement and tilt.
 
-| Stage | Default | Output |
-|---|---|---|
-| Teacher PPO | same task reward and final PPO iterations as A | `teacher.pt` |
-| Behavior cloning | 1,000,000 teacher-rollout transitions, 10 epochs | student initialization |
-| DAgger | 10 rounds × 100,000 student-rollout transitions, 3 epochs on accumulated data | `policy.pt` |
-| Deployment | 36 → 256 → 256 → 6, tanh activations and tanh output | `student_actor.pt` |
+Minimum bottom-corner gap must be ≤0.5 mm and the 20 ms average normal load ≥0.1mg.
+The load window is initialized from the settled static load. Any substep without
+normal load is separately logged: positive average load alone does not establish
+uninterrupted contact. Full-face modes check all four support vertices against
+the tray; tipping checks its two supporting edge vertices.
 
-Distillation minimizes normalized-action MSE, batch size 4096, Adam learning rate
-3e-4. All datasets stay on the selected device. Teacher labels are queried at the
-student's actual visited states; invalid labels are excluded and those rollouts
-terminated. Rejected-label fractions are logged. Config keys in `distill` are
-`samples`, `epochs`, `batch_size`, `learning_rate`, `dagger_rounds`, `dagger_samples`,
-and `dagger_epochs`. A direct `train --config ...` run can override these budgets.
-F's additional simulation and distillation cost must be included in comparisons;
-equal teacher PPO iterations do not imply equal total compute or transitions.
+Sticking endpoint error must be <5 mm, speed <0.03 m/s and spin <0.1 rad/s.
+Sliding/twisting end on first target passage; tipping ends at 80°, before new-face
+impact. These three tasks **do not require terminal rest or recovery to sticking**.
+Reverse-speed thresholds are -0.03 m/s (sliding) and -0.10 rad/s (rotating modes).
 
-Deployment requires only the exported actor, with **no feasible-set mapping**:
+Speed limits are termination checks, not additional contact-polyhedron rows.
+The instantaneous teacher does not certify trajectory-level speed safety.
+There is no height constraint or terminal vertical braking phase. Downward travel
+and terminal vertical velocity are reported; angle completion is not a complete
+stop-and-recover maneuver.
 
-```python
-actor = torch.jit.load("student_actor.pt", map_location="cuda:0")
-with torch.inference_mode():
-    normalized_action = actor(observation)  # [batch, 36] -> [batch, 6]
-    acceleration = normalized_action * observation.new_tensor([60, 60, 60, 30, 30, 30])
-```
+## Methods
 
-The student has no hard feasibility guarantee. The teacher's certificate is an
-instantaneous analytic-model property, not a guarantee for the whole 20 ms physics
-interval or the entire episode. Physical contact/mode deviations remain measured
-by the unchanged independent simulator. Report both teacher and student success,
-physical failure, nominal constraint violations, and mapping failures.
+All groups share -dt +10*success -10*failure (including timeout) and potential
+shaping gamma*Phi(next)-Phi(now), with zero terminal potential. All progress and
+observation terms use configured targets. Extra costs are multiplied by dt.
 
-## Physics and geometry
-
-The payload is simulated by MuJoCo-Warp in the accelerating tray coordinate frame.
-The tray geometry is static in that frame. Per-substep fictitious forces and
-torques account for translation, angular acceleration, centrifugal, Coriolis and
-gyroscopic terms. Tray world pose/velocity are integrated separately. This avoids
-servo tracking error or the assumption of a heavy tray, while contact impulses
-and object motion remain independently solved by MuJoCo.
-
-The CPU bank builder performs **V-to-H double description** by intersecting each
-cone with f_z=1, converting vertices to facets with Qhull in its affine hull, and
-homogenizing. Equality constraints are retained. Static contact uses an inscribed
-8-direction friction polygon; sliding/twisting use fixed Coulomb rays. Twisting
-uses the four-vertex contact approximation, not an exact continuous pressure model.
-
-At runtime the wrench cone is shifted/rotated and pulled back through Newton-Euler
-dynamics. For these models a contact-cone equality uniquely determines the scalar
-beta. Eliminate it algebraically and impose
-
-$$\beta\ge -\frac{v_\parallel}{2\Delta t},\qquad
-v_\parallel^+=v_\parallel+\beta\Delta t\ge\tfrac12v_\parallel.$$
-
-Use tray-frame relative x velocity for sliding, relative y angular velocity for
-tipping, and relative z angular velocity for twisting. Direction preservation
-assumes the current signed speed is nonnegative. For each fixed state this is an
-affine halfspace. Equivalently, substitute
-`beta = gamma - v_parallel/(2 dt)`, `gamma >= 0`, in the lifted wrench equations
-and project the translated cone; no repeated double description is needed.
-Action bounds are included in the final acceleration polyhedron.
-
-Relative margin uses the affine-hull projector and facet slacks in fixed physical
-metric coordinates `chi / (30,30,30,15,15,15)`. Those units do not expand with the
-action box: policy actions `z` map to metric coordinates `2*z`, whose box is now
-`[-2,2]^6`. Thus doubling action bounds does not halve distance or margin penalties
-at a fixed physical displacement. Teacher mapping uses policy coordinates instead.
-Distance uses **48 fixed FISTA iterations** for the convex projection dual: it is
-a numerical approximation, not an exact signed-distance formula. Iterations are
-configurable in `EnvConfig`. Equality-normal distance is handled separately.
-Analytic geometry is used by C/D/E rewards and F's teacher mapping, never as an
-extra policy input. F uses actual projected mode velocities; unlike E it does not
-zero them until the measured entry threshold. At exact rest these velocities
-already vanish, giving the same startup dynamics.
-
-All batches and physics operate on the selected GPU. Python loops are over PPO
-steps, physics substeps and solver iterations, never over simulation worlds.
-CPU double description runs only when generating parameter banks. Geometry and
-reward costs must be included when reporting training throughput.
-The official mjlab `Simulation`, configuration, model randomization and reset
-interfaces are reused. The existing compact PPO loop is retained to score latent
-teacher actions explicitly and keep A-E comparable. Teacher/baseline actors,
-critics and the deployment student all use the official `rsl_rl.modules.MLP`
-from mjlab's RSL-RL dependency; no local MLP implementation is maintained.
-
-## Source map
-
-| File | Responsibility |
+| Group | Additional mechanism |
 |---|---|
-| `bank.py` | randomized parameter banks and double description |
-| `geometry.py` | beta elimination, acceleration constraints, margin/distance |
-| `mapping.py` | normalized constraints, affine-hull gauge map, batched interior solver |
-| `env.py` | mjlab simulation, shared 36D observation, four tasks, A-F rewards |
-| `ppo.py` | PPO training, fixed-sample validation/test |
-| `distill.py` | teacher action labels, BC, DAgger, student export |
-| `pipeline.py` | weight grid, GPU scheduling, best-setting selection |
+| A | task reward only |
+| B | unwanted-motion penalty |
+| C | squared distance to acceleration set after entry |
+| D | C plus relative-margin penalty |
+| E | D plus near-rest startup-branch cost until measured entry |
+| F | constrain teacher actions, then distill an unconstrained student |
 
-Development tests (not part of the training pipeline):
+Margin penalty is softplus((0.05-relative_margin)/0.05), positive even inside the
+set and decreasing with margin. Relative margin is within the affine hull, not a
+positive ambient 6D ball for sliding/twisting. Distance includes equality errors.
+Fixed perturbation units are (30,30,30,15,15,15) for [alpha,a], independent of
+method/action limits. Distance uses 48 FISTA iterations and is approximate.
+
+Entry is latched from measured speed >0.02 m/s (sliding) or >0.10 rad/s (rotating).
+E zeros relative velocities in its pre-entry approximation; this is not a full
+hybrid-transition certificate. The common bound beta >= -v_parallel/(2*dt)
+permits braking, uses measured speed and allows beta=0 at rest. The shared goal
+reward must encourage startup. Weight grids remain in pipeline.grid.
+
+## Geometry and F
+
+The offline builder intersects the generator cone with f_z=1, computes facets
+with Qhull in its affine hull, then homogenizes and retains equalities.
+Sticking/tipping use an inscribed eight-direction friction polygon;
+sliding/twisting use fixed Coulomb rays. Twisting uses a four-corner pressure
+model, not a continuous pressure distribution. Online Newton–Euler pullback and
+scalar elimination give acceleration constraints. Per-task action bounds are
+shared by the simulator, margin calculation and teacher mapping.
+
+For Az<=b, Ez=e and -1<=z<=1, F finds a verified relative-interior point z0 and
+nullspace basis Q. With G=AQ and h=b-Az0 its map is
+z=z0+Q*u/(1+max_i(G_i*u/h_i)). PPO scores latent Gaussian u, not mapped actions.
+Latent dimensions are 6/4/6/4. Final residual checks reject unverified actions;
+no zero-action fallback is claimed feasible. A failed interior search is not
+proof of emptiness. The six-output student uses only an MLP at deployment and
+inherits no hard feasibility guarantee. Teacher and student are scored separately.
+
+The payload is independently simulated in the accelerating tray frame. Per-substep
+fictitious force/torque includes centrifugal, Coriolis and gyroscopic terms;
+tray world pose is integrated separately. There is no contact enforcement or
+heavy-tray approximation. All online physics/geometry uses the selected device.
+
+## Observations, outputs and evaluation
+
+Shared 36 inputs: COM position /0.4 (3), rotation (9), relative velocity /2 (3),
+relative angular velocity /3 (3), tray velocity in tray frame /2 (3), tray angular
+velocity /3 (3), gravity /9.81 (3), task-normalized dimensions (3), task-normalized
+friction (1), normalized goal error (3), entry flag (1), time/timeout (1).
+Every method receives exact geometry/friction; this is not a perception test.
+
+Evaluation uses paired first-episode batches, not repeated episodes favoring fast
+failures. Noise levels 0/.01/.03/.05 refer to fixed metric units before action
+clipping. Nominal constraint violations use normalized rows and tolerance 1e-4
+before disturbance/reset. JSON results include success/time, physical/mapping
+failures, timeouts, substep maximum mode error/gap, normal load, no-contact rate,
+downward travel and terminal vertical velocity. Five fixed friction bins report
+sample counts and success rates, averaging over the shared size distribution.
+
+Main figures: **learning curves and success versus friction for each mode**, plus
+a representative trajectory. Compare training seeds; do not infer RL superiority
+from reference-trajectory success. Sticking E and D are the same method here.
+
+Outputs: search/<task>/<group>/<candidate>, best/<task>/<group>, results.csv.
+F retains teacher.pt, student policy.pt, student_actor.pt, separate test results,
+and distillation logs. Search and final budgets default to 300/2000 iterations;
+validation/test sizes default to 2048/8192 (F final validation: 4096).
+
+## Validation
 
 ```bash
-pip install pytest
-pytest tests -q
+python -m pip install pytest
+python -m pytest tests -q
 ```
 
-The mathematical tests compare DD membership, scalar elimination and gauge-map
-relative feasibility against independent linear programs; they also check inverse
-mapping, nonzero-speed braking bounds, fixed reward units, invalid-set rejection,
-batch independence and first-event ordering. Physics tests check
-world-frame free fall, observation frames, failure resets, and a small real-physics
-PPO → BC → DAgger → exported-student run. H200 throughput and
-policy learning results must be measured on the training server; no trained
-success rates are claimed by this repository.
+Tests cover DD/scalar elimination against independent LPs, teacher mapping,
+physical-unit scaling, targets, event ordering, physical contact checks,
+MuJoCo-Warp stepping, and a small PPO→BC→DAgger→student export run.
+See docs/validation.md for reference-trajectory evidence and limitations.
+H200 throughput, trained success rates and G1 execution require separate tests.

@@ -6,9 +6,9 @@ from .geometry import SCALE
 from .math import mv
 
 
-def normalized_constraints(inequalities, equalities):
+def normalized_constraints(inequalities, equalities, action_scale=SCALE):
     """Az <= b, Ez = e in normalized acceleration coordinates, including bounds."""
-    scale = inequalities.new_tensor(SCALE)
+    scale = torch.as_tensor(action_scale, device=inequalities.device, dtype=inequalities.dtype)
     n = len(inequalities)
     eye = torch.eye(6, device=scale.device, dtype=scale.dtype).expand(n, 6, 6)
     a = torch.cat((inequalities[..., :6] * scale, eye, -eye), 1)
@@ -71,8 +71,10 @@ class GaugeMap:
     """u in R^r -> z0 + Q u/(1 + max_i (G_i u / h_i))."""
 
     @torch.no_grad()
-    def __init__(self, inequalities, equalities, iterations=32):
-        self.a, self.b, self.e, self.rhs = normalized_constraints(inequalities, equalities)
+    def __init__(self, inequalities, equalities, iterations=32, action_scale=SCALE):
+        self.a, self.b, self.e, self.rhs = normalized_constraints(
+            inequalities, equalities, action_scale
+        )
         a, b, e, rhs = self.a, self.b, self.e, self.rhs
         n, k = e.shape[:2]
         if k:

@@ -3,10 +3,11 @@
 import torch
 
 from .math import mv, skew
+from .settings import METRIC_SCALE
 
-# Policy actions are in [-1, 1]; reward geometry keeps its original physical units.
+# Legacy standalone-call default. Training always passes its per-task limits;
+# reward geometry keeps fixed physical perturbation units independently.
 SCALE = (60.0, 60.0, 60.0, 30.0, 30.0, 30.0)
-METRIC_SCALE = (30.0, 30.0, 30.0, 15.0, 15.0, 15.0)
 
 
 def acceleration_constraints(
@@ -110,16 +111,16 @@ def acceleration_constraints(
     return inequalities, equalities
 
 
-def measures(inequalities, equalities, action, iterations=48):
+def measures(inequalities, equalities, action, iterations=48, action_scale=SCALE):
     """Relative slack and fixed-iteration Euclidean projection distance.
 
     Coordinates use fixed METRIC_SCALE units, independently of action bounds.
-    The input action is policy-normalized by SCALE. FISTA solves the
+    The input action is policy-normalized by action_scale. FISTA solves the
     halfspace projection dual on GPU; no per-world optimizer or host synchronization.
     """
     n = action.shape[0]
     scale = action.new_tensor(METRIC_SCALE)
-    bounds = action.new_tensor(SCALE) / scale
+    bounds = torch.as_tensor(action_scale, device=action.device, dtype=action.dtype) / scale
     action = action * bounds
     eye = torch.eye(6, device=action.device).expand(n, 6, 6)
     a = inequalities[:, :, :6] * scale
