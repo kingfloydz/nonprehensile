@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nonprehensile"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["mjlab==1.6.0", "scipy>=1.15", "numpy>=2", "torch>=2.7"]
+dependencies = ["mjlab==1.6.0", "rsl-rl-lib==5.4.2", "scipy>=1.15", "numpy>=2", "torch>=2.7"]
 
 [project.scripts]
 npt = "nonprehensile.cli:main"

@@ -1,6 +1,9 @@
 import json
 
 import torch
+import pytest
+from rsl_rl.algorithms import PPO
+from rsl_rl.storage import RolloutStorage
 
 from nonprehensile import ppo
 from nonprehensile.bank import build
@@ -84,3 +87,71 @@ def test_actual_evaluation_reports_paired_friction_bins_and_timeout(tmp_path):
     assert sum(item["episodes"] for item in first["friction_bins"]) == 2
     assert first["mean_abs_terminal_vertical_speed"] == 0
     assert first["mean_episode_min_normal_load"] > 0.1
+
+
+@pytest.mark.parametrize("actions", [4, 6])
+def test_official_ppo_updates_raw_action_policy(actions):
+    torch.manual_seed(7)
+    policy = ppo.Policy(36, actions=actions)
+    obs = ppo.observations_dict(torch.randn(8, 36))
+    storage = RolloutStorage("rl", 8, 4, obs, [actions], "cpu")
+    algorithm = PPO(
+        policy.actor,
+        policy.critic,
+        storage,
+        num_learning_epochs=2,
+        num_mini_batches=2,
+        learning_rate=3e-4,
+    )
+    algorithm.optimizer.register_step_pre_hook(ppo.check_optimizer_step)
+    before = [p.detach().clone() for p in policy.parameters()]
+    with torch.no_grad():
+        for _ in range(4):
+            raw = algorithm.act(obs)
+            assert raw.shape == (8, actions)
+            algorithm.process_env_step(obs, -raw.square().sum(-1), torch.zeros(8), {})
+        algorithm.compute_returns(obs)
+    losses = algorithm.update()
+    assert all(torch.isfinite(torch.tensor(v)) for v in losses.values())
+    assert all(torch.isfinite(p).all() for p in policy.parameters())
+    assert any(not torch.equal(old, new) for old, new in zip(before, policy.parameters()))
+    assert storage.step == 0
+
+
+def test_nonfinite_gradient_cannot_corrupt_optimizer_parameters():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.Adam([parameter])
+    optimizer.register_step_pre_hook(ppo.check_optimizer_step)
+    parameter.grad = torch.tensor(float("nan"))
+    with pytest.raises(FloatingPointError, match="gradient"):
+        optimizer.step()
+    assert parameter.item() == 1.0
+    assert not optimizer.state
+
+
+def test_rollout_finite_check_rejects_bad_reward():
+    with pytest.raises(FloatingPointError, match="reward"):
+        ppo.require_finite(reward=torch.tensor([0.0, float("nan")]))
+
+
+def test_training_saves_diagnostics_on_invalid_environment(tmp_path, monkeypatch):
+    class InvalidEnv:
+        def __init__(self, cfg, bank, device):
+            self.entered = torch.zeros(cfg.num_envs, dtype=torch.bool)
+
+        def observe(self):
+            return torch.zeros(2, 36)
+
+        def step(self, action, invalid):
+            return self.observe(), torch.full((2,), float("nan")), torch.zeros(2), {}
+
+    monkeypatch.setattr(ppo, "TrayEnv", InvalidEnv)
+    config = configuration("sticking", "B", 2, 1)
+    config["ppo"].update(compile=False, rollout_steps=2, minibatches=1)
+    with pytest.raises(RuntimeError, match="diagnostics"):
+        ppo.train(config, None, None, tmp_path, device="cpu")
+    saved = torch.load(tmp_path / "failure.pt", weights_only=False)
+    assert saved["iteration"] == 1
+    assert saved["error"] == "Non-finite reward"
+    assert "optimizer_state_dict" in saved["algorithm"]
+    assert saved["storage"].step == 0

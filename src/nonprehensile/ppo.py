@@ -1,12 +1,17 @@
-"""Batched tanh-Gaussian PPO, one seed per run."""
+"""Task adapters for the official RSL-RL PPO used by mjlab."""
 
 import json
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import torch
+from rsl_rl.algorithms import PPO
+from rsl_rl.models import MLPModel
+from rsl_rl.storage import RolloutStorage
 from rsl_rl.modules import MLP
+from tensordict import TensorDict
 from torch import nn
 
 from .env import EnvConfig, TrayEnv
@@ -14,22 +19,53 @@ from .mapping import GaugeMap, normalized_constraints, violation
 from .settings import BENCHMARK_VERSION, SETTINGS
 
 
+def observations_dict(obs):
+    return TensorDict({"state": obs}, batch_size=[obs.shape[0]])
+
+
 class Policy(nn.Module):
+    """Checkpoint/evaluation facade; distributions and models belong to RSL-RL."""
+
     def __init__(self, observations, hidden=256, actions=6, kind="direct"):
         super().__init__()
         self.kind, self.actions = kind, actions
-        self.actor = MLP(observations, actions, [hidden, hidden], activation="tanh")
-        self.critic = MLP(observations, 1, [hidden, hidden], activation="tanh")
-        self.log_std = nn.Parameter(torch.full((actions,), -0.7))
+        obs = observations_dict(torch.zeros(1, observations))
+        groups = {"actor": ["state"], "critic": ["state"]}
+        self.actor = MLPModel(
+            obs,
+            groups,
+            "actor",
+            actions,
+            hidden_dims=[hidden, hidden],
+            activation="tanh",
+            distribution_cfg=dict(
+                class_name="GaussianDistribution",
+                std_type="log",
+                init_std=math.exp(-0.7),
+                std_range=(math.exp(-3), math.e),
+            ),
+        )
+        self.critic = MLPModel(
+            obs, groups, "critic", 1, hidden_dims=[hidden, hidden], activation="tanh"
+        )
 
     def forward(self, obs):
+        obs = observations_dict(obs)
         return self.actor(obs), self.critic(obs).squeeze(-1)
 
-    def distribution(self, obs):
-        mean, value = self(obs)
-        return torch.distributions.Normal(
-            mean, self.log_std.clamp(-3, 1).exp(), validate_args=False
-        ), value
+
+def require_finite(**tensors):
+    for name, tensor in tensors.items():
+        if not torch.isfinite(tensor).all():
+            raise FloatingPointError(f"Non-finite {name}")
+
+
+def check_optimizer_step(optimizer, args, kwargs):
+    """Abort before Adam writes non-finite gradients into otherwise valid weights."""
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.grad is not None:
+                require_finite(gradient=parameter.grad)
 
 
 class Student(nn.Module):
@@ -178,58 +214,70 @@ def train(config, train_bank, validation_bank, output, device="cuda:0"):
     model = Policy(
         obs.shape[-1], actions=latent if teacher else 6, kind="teacher" if teacher else "direct"
     ).to(device)
-    if hp["compile"]:
-        model.forward = torch.compile(model.forward)
-    optimizer = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"], eps=1e-5)
     steps, n = hp["rollout_steps"], cfg.num_envs
-    observations = torch.empty((steps, *obs.shape), device=device)
-    actions = torch.empty((steps, n, model.actions), device=device)
-    logs, values, rewards, dones = [torch.empty((steps, n), device=device) for _ in range(4)]
+    if steps * n < 2 or not 1 <= hp["minibatches"] <= steps * n:
+        raise ValueError("PPO needs at least two transitions and nonempty minibatches")
+    storage = RolloutStorage("rl", n, steps, observations_dict(obs), [model.actions], device)
+    algorithm = PPO(
+        model.actor,
+        model.critic,
+        storage,
+        num_learning_epochs=hp["epochs"],
+        num_mini_batches=hp["minibatches"],
+        learning_rate=hp["learning_rate"],
+        gamma=hp["gamma"],
+        lam=hp["gae_lambda"],
+        entropy_coef=hp["entropy"],
+        value_loss_coef=0.5,
+        schedule="adaptive",
+        desired_kl=hp.get("desired_kl", 0.01),
+        use_clipped_value_loss=True,
+        device=device,
+    )
+    algorithm.optimizer.register_step_pre_hook(check_optimizer_step)
+    algorithm.compile("default" if hp["compile"] else None)
     start = time.monotonic()
     with (output / "learning.jsonl").open("w") as stream:
         for iteration in range(hp["iterations"]):
             finished = torch.zeros(4, device=device)
-            with torch.no_grad():
-                for t in range(steps):
-                    distribution, value = model.distribution(obs)
-                    raw = distribution.sample()
-                    observations[t], actions[t], values[t] = obs, raw, value
-                    logs[t] = distribution.log_prob(raw).sum(-1)
-                    action, invalid = execute_action(model, env, raw)
-                    obs, reward, done, info = env.step(action, invalid)
-                    rewards[t], dones[t] = reward, done.float()
-                    finished[0] += done.sum()
-                    finished[1] += info["success"].sum()
-                    finished[2] += (info["time"] * info["success"]).sum()
-                    finished[3] += info["mapping_failure"].sum()
-                _, next_value = model(obs)
-                advantage = torch.empty_like(rewards)
-                gae = torch.zeros(n, device=device)
-                for t in reversed(range(steps)):
-                    continuation = 1 - dones[t]
-                    delta = rewards[t] + hp["gamma"] * next_value * continuation - values[t]
-                    gae = delta + hp["gamma"] * hp["gae_lambda"] * continuation * gae
-                    advantage[t] = gae
-                    next_value = values[t]
-                returns = advantage + values
-                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-            flat_obs, flat_action = observations.flatten(0, 1), actions.flatten(0, 1)
-            flat_log, flat_adv, flat_return = logs.flatten(), advantage.flatten(), returns.flatten()
-            for _ in range(hp["epochs"]):
-                permutation = torch.randperm(steps * n, device=device)
-                for batch in permutation.chunk(hp["minibatches"]):
-                    distribution, value = model.distribution(flat_obs[batch])
-                    log = distribution.log_prob(flat_action[batch]).sum(-1)
-                    ratio = (log - flat_log[batch]).exp()
-                    surrogate = torch.minimum(
-                        ratio * flat_adv[batch], ratio.clamp(0.8, 1.2) * flat_adv[batch]
-                    )
-                    loss = -surrogate.mean() + 0.5 * (value - flat_return[batch]).square().mean()
-                    loss -= hp["entropy"] * distribution.entropy().sum(-1).mean()
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+            try:
+                with torch.no_grad():
+                    for t in range(steps):
+                        require_finite(observation=obs)
+                        raw = algorithm.act(observations_dict(obs))
+                        require_finite(action=raw, value=algorithm.transition.values)
+                        action, invalid = execute_action(model, env, raw)
+                        obs, reward, done, info = env.step(action, invalid)
+                        require_finite(next_observation=obs, reward=reward)
+                        # Timeout is task failure here, not an infinite-horizon truncation.
+                        # Store the raw latent action, including for the constrained teacher.
+                        algorithm.process_env_step(observations_dict(obs), reward, done, {})
+                        finished[0] += done.sum()
+                        finished[1] += info["success"].sum()
+                        finished[2] += (info["time"] * info["success"]).sum()
+                        finished[3] += info["mapping_failure"].sum()
+                    algorithm.compute_returns(observations_dict(obs))
+                    require_finite(advantages=storage.advantages, returns=storage.returns)
+                    reward_mean = storage.rewards.mean().item()
+                losses = algorithm.update()
+                for name, parameter in model.named_parameters():
+                    require_finite(**{name: parameter})
+            except (FloatingPointError, RuntimeError) as exc:
+                torch.save(
+                    dict(
+                        iteration=iteration + 1,
+                        error=str(exc),
+                        config=config,
+                        algorithm=algorithm.save(),
+                        storage=storage,
+                        observation=obs,
+                        rng=torch.get_rng_state(),
+                    ),
+                    output / "failure.pt",
+                )
+                raise RuntimeError(
+                    f"PPO failed at iteration {iteration + 1}; diagnostics: {output / 'failure.pt'}"
+                ) from exc
             if (iteration + 1) % hp["log_interval"] == 0:
                 totals = finished.cpu().tolist()
                 row = dict(
@@ -240,14 +288,18 @@ def train(config, train_bank, validation_bank, output, device="cuda:0"):
                     successes=totals[1],
                     success_time_sum=totals[2],
                     mapping_failures=totals[3],
-                    reward=rewards.mean().item(),
-                    loss=loss.item(),
+                    reward=reward_mean,
+                    loss=losses["surrogate"]
+                    + 0.5 * losses["value"]
+                    - hp["entropy"] * losses["entropy"],
+                    losses=losses,
+                    learning_rate=algorithm.learning_rate,
                 )
                 stream.write(json.dumps(row) + "\n")
                 stream.flush()
                 print(json.dumps(row), flush=True)
     save_policy(model, obs.shape[-1], config, output / ("teacher.pt" if teacher else "policy.pt"))
-    del env
+    del algorithm, storage, env
     metrics = evaluate(model, cfg, validation_bank, hp["validation_episodes"], device)
     if teacher:
         (output / "teacher_validation.json").write_text(json.dumps(metrics, indent=2))
@@ -267,6 +319,8 @@ def test(checkpoint, bank, output, episodes=8192, device="cuda:0"):
     if payload["observations"] != 36:
         raise ValueError("This version uses 36 observations; retrain older 46-input checkpoints.")
     kind = payload.get("kind", "direct")
+    if kind != "student" and "log_std" in payload["policy"]:
+        raise ValueError("Legacy custom-PPO checkpoint; retrain with the RSL-RL backend.")
     model = (
         Student(payload["observations"])
         if kind == "student"

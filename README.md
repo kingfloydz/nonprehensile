@@ -186,3 +186,23 @@ physical-unit scaling, targets, event ordering, physical contact checks,
 MuJoCo-Warp stepping, and a small PPO→BC→DAgger→student export run.
 See docs/validation.md for reference-trajectory evidence and limitations.
 H200 throughput, trained success rates and G1 execution require separate tests.
+
+
+## Official PPO backend
+
+Training now delegates distributions, rollout storage, GAE and minibatch updates
+to mjlab's pinned RSL-RL 5.4.2. Raw Gaussian actions are stored for PPO; tanh (A-E)
+or the geometric map (F) is applied only at the environment boundary. Timeouts
+remain terminal task failures, not infinite-horizon truncations.
+
+The adaptive KL learning-rate schedule (target 0.01) and clipped value loss are
+enabled. Logs report mean update losses and the current learning rate. Finite
+checks reject bad observations/rewards/returns; an optimizer pre-step hook rejects
+non-finite gradients before Adam writes them into weights. Failures write
+`failure.pt` with the algorithm, optimizer, rollout and observation for diagnosis.
+Official PPO does not itself guarantee numerical stability.
+
+Use a fresh output root and retrain. Legacy custom-PPO direct/teacher checkpoints
+are rejected; student exports are unchanged. Task rewards, validation and the
+BC/DAgger procedure are retained. Compare newly trained baselines under this
+backend rather than mixing old and new results.
